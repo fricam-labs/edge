@@ -63,3 +63,4 @@ services:
 
 volumes:
   fricam_edge_identity:
+    name: fricam_edge_identity
