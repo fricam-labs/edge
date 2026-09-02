@@ -1,0 +1,225 @@
+package main
+
+import (
+	"context"
+	"encoding/base64"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func boolPtr(value bool) *bool { return &value }
+
+func TestContainsIDR(t *testing.T) {
+	tests := []struct {
+		name  string
+		codec string
+		data  []byte
+		want  bool
+	}{
+		{"h264 IDR", "h264", []byte{0, 0, 1, 0x65}, true},
+		{"h264 P-frame", "h264", []byte{0, 0, 1, 0x41}, false},
+		{"h265 IDR", "h265", []byte{0, 0, 0, 1, 19 << 1}, true},
+		{"h265 non-IDR", "h265", []byte{0, 0, 1, 1 << 1}, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := containsIDR(test.data, test.codec); got != test.want {
+				t.Fatalf("containsIDR() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestSelectCameraStreams(t *testing.T) {
+	front := cameraConfig{Enabled: boolPtr(true)}
+	front.Live.Streams = map[string]string{"Grid": "front_sub", "HD": "front_main"}
+	garage := cameraConfig{Enabled: boolPtr(false)}
+	garage.Live.Streams = map[string]string{"HD": "garage_main"}
+	garden := cameraConfig{Enabled: boolPtr(true)}
+	cfg := frigateConfig{Cameras: map[string]cameraConfig{
+		"front": front, "garage": garage, "garden": garden,
+	}}
+	got := selectCameraStreams(cfg, "hd")
+	if !equalStrings(got["front"], []string{"front_main", "front_sub", "front"}) {
+		t.Fatalf("unexpected front candidates: %#v", got["front"])
+	}
+	if !equalStrings(got["garden"], []string{"garden"}) {
+		t.Fatalf("unexpected garden candidates: %#v", got["garden"])
+	}
+	if _, exists := got["garage"]; exists {
+		t.Fatal("disabled camera was selected")
+	}
+}
+
+func TestTSPayloadWithoutAdaptation(t *testing.T) {
+	packet := make([]byte, packetSize)
+	packet[0] = 0x47
+	packet[3] = 0x10
+	payload, ok := tsPayload(packet)
+	if !ok || len(payload) != packetSize-4 {
+		t.Fatalf("unexpected payload: ok=%v len=%d", ok, len(payload))
+	}
+}
+
+func TestCameraFromPath(t *testing.T) {
+	name, ok := cameraFromPath("/stream/kapi_onu.ts")
+	if !ok || name != "kapi_onu" {
+		t.Fatalf("cameraFromPath() = %q, %v", name, ok)
+	}
+	for _, path := range []string{"/stream/.ts", "/stream/kapi_onu", "/stream/a/b.ts"} {
+		if _, ok := cameraFromPath(path); ok {
+			t.Fatalf("cameraFromPath(%q) unexpectedly succeeded", path)
+		}
+	}
+}
+
+func TestDeriveIdentityIsStableAndSeparated(t *testing.T) {
+	identity := deriveIdentity("test-root-secret")
+	if len(identity.DeviceID) != 43 || len(identity.ClientToken) != 43 {
+		t.Fatalf("unexpected identity lengths: device=%d client=%d", len(identity.DeviceID), len(identity.ClientToken))
+	}
+	if identity.DeviceID == identity.ClientToken || identity.ClientToken == identity.RootSecret {
+		t.Fatal("derived identity values are not separated")
+	}
+	if deriveIdentity(identity.RootSecret) != identity {
+		t.Fatal("identity derivation is not stable")
+	}
+	if _, err := base64.RawURLEncoding.DecodeString(identity.DeviceID); err != nil {
+		t.Fatalf("device id is not base64url: %v", err)
+	}
+}
+
+func TestIdentityPersistsWithPrivatePermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "identity.json")
+	first, err := loadOrCreateIdentity(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := loadOrCreateIdentity(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatal("persisted identity changed")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("identity permissions = %o, want 600", info.Mode().Perm())
+	}
+}
+
+func TestValidateFrigateAuthorizationStaysOnPrivateHost(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/config" || r.Header.Get("Authorization") != "Bearer secret" ||
+			r.Header.Get("Cookie") != "frigate_token=secret" {
+			http.Error(w, "bad auth forwarding", http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	if !validateFrigateAuthorization(context.Background(), server.URL, "Bearer secret") {
+		t.Fatal("valid private Frigate authorization was rejected")
+	}
+	if validateFrigateAuthorization(context.Background(), "https://example.com", "Bearer secret") {
+		t.Fatal("authorization could be forwarded to a public host")
+	}
+	if validateFrigateAuthorization(context.Background(), server.URL, "") {
+		t.Fatal("empty authorization was accepted")
+	}
+}
+
+func TestValidateFrigateAuthorizationRejectsRedirect(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/accepted", http.StatusTemporaryRedirect)
+	}))
+	defer server.Close()
+	if validateFrigateAuthorization(context.Background(), server.URL, "Bearer secret") {
+		t.Fatal("redirected authorization check was accepted")
+	}
+}
+
+func TestPairingCodeIsSingleUseAndExpires(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	manager := newPairingManager(deriveIdentity("pairing-root"))
+	manager.now = func() time.Time { return now }
+	payload, err := manager.issue("http://192.168.1.20:8099")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if payload.Type != "fricam-edge-pair" || payload.Version != 1 || payload.DeviceID != manager.identity.DeviceID {
+		t.Fatalf("unexpected pairing payload: %#v", payload)
+	}
+	if !manager.claim(payload.Code) || manager.claim(payload.Code) {
+		t.Fatal("pairing code was not exactly single-use")
+	}
+
+	expiring, err := manager.issue("http://192.168.1.20:8099")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(pairingCodeTTL + time.Second)
+	if manager.claim(expiring.Code) {
+		t.Fatal("expired pairing code was accepted")
+	}
+}
+
+func TestPairingPageOriginMustBePrivate(t *testing.T) {
+	privateRequest := httptest.NewRequest(http.MethodGet, "http://192.168.1.20:8099/pairing", nil)
+	if origin, ok := pairingOrigin(privateRequest); !ok || origin != "http://192.168.1.20:8099" {
+		t.Fatalf("private origin = %q, %v", origin, ok)
+	}
+	publicRequest := httptest.NewRequest(http.MethodGet, "https://edge.example.com/pairing", nil)
+	if _, ok := pairingOrigin(publicRequest); ok {
+		t.Fatal("public pairing origin was accepted")
+	}
+}
+
+func TestPairingPageKeepsTechnicalIdentityOutOfTheUI(t *testing.T) {
+	manager := newPairingManager(deriveIdentity("pairing-page-root"))
+	request := httptest.NewRequest(http.MethodGet, "http://192.168.1.20:8099/pairing", nil)
+	recorder := httptest.NewRecorder()
+	manager.servePage(recorder, request)
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK || !strings.Contains(body, "Scan to connect") {
+		t.Fatalf("pairing page status=%d", recorder.Code)
+	}
+	if strings.Contains(body, "Device ") || strings.Contains(body, manager.identity.DeviceID[:8]) {
+		t.Fatal("pairing page exposed the technical device identifier")
+	}
+}
+
+func TestSignalMetadataDoesNotExposeCandidateAddress(t *testing.T) {
+	kind, candidateType := signalMetadata([]byte(`{"type":"webrtc/candidate","value":"candidate:1 1 udp 1 203.0.113.2 5000 typ relay"}`))
+	if kind != "candidate" || candidateType != "relay" {
+		t.Fatalf("signal metadata = %q, %q", kind, candidateType)
+	}
+	if kind, candidateType = signalMetadata([]byte(`{"type":"webrtc/offer","value":"secret-sdp"}`)); kind != "offer" || candidateType != "-" {
+		t.Fatalf("offer metadata = %q, %q", kind, candidateType)
+	}
+	if kind, candidateType = signalMetadata([]byte(`{"type":"webrtc","value":{"type":"offer","sdp":"secret-sdp"}}`)); kind != "offer" || candidateType != "-" {
+		t.Fatalf("v2 offer metadata = %q, %q", kind, candidateType)
+	}
+}
+
+func TestV2OfferOnlyAllowsCloudflareICEServers(t *testing.T) {
+	credential := strings.Repeat("a", 64)
+	valid := []byte(fmt.Sprintf(`{"type":"webrtc","value":{"type":"offer","sdp":"v=0","ice_servers":[{"urls":["stun:stun.cloudflare.com:3478"]},{"urls":["turns:turn.cloudflare.com:443?transport=tcp"],"username":"%s","credential":"%s"}]}}`, credential, credential))
+	if _, ok := sanitizeSignalForGo2RTC(valid); !ok {
+		t.Fatal("valid Cloudflare V2 offer was rejected")
+	}
+	malicious := []byte(fmt.Sprintf(`{"type":"webrtc","value":{"type":"offer","sdp":"v=0","ice_servers":[{"urls":["turn:192.168.1.1:3478"],"username":"%s","credential":"%s"}]}}`, credential, credential))
+	if _, ok := sanitizeSignalForGo2RTC(malicious); ok {
+		t.Fatal("non-Cloudflare ICE server was accepted")
+	}
+}

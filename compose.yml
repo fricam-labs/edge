@@ -1,0 +1,65 @@
+services:
+  fricam-edge-identity-init:
+    image: busybox:1.37.0
+    command:
+      - sh
+      - -c
+      - chown -R 65532:65532 /data 2>/dev/null || true; chmod 700 /data 2>/dev/null || true; test "$(stat -c %u /data)" = 65532
+    user: "0:0"
+    network_mode: none
+    restart: "no"
+    volumes:
+      - fricam_edge_identity:/data
+    read_only: true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+
+  fricam-edge:
+    image: ghcr.io/fricam-labs/edge:latest
+    build: .
+    container_name: fricam-edge
+    restart: unless-stopped
+    depends_on:
+      fricam-edge-identity-init:
+        condition: service_completed_successfully
+    network_mode: host
+    environment:
+      # Discovery is restricted by the Android HostGuard to LAN/Tailscale.
+      LISTEN_ADDR: 0.0.0.0:8099
+      FRIGATE_URL: http://127.0.0.1:5000
+      GO2RTC_URL: http://127.0.0.1:1984
+      LIVE_QUALITY: HD
+      DISCOVERY_INTERVAL_SEC: 30
+      SOURCE_IDLE_TIMEOUT_SEC: 15
+      MAX_CACHE_MIB: 16
+      # Production remote access: outbound signaling only. No tunnel or
+      # inbound public port is required.
+      EDGE_RELAY_URL: ${EDGE_RELAY_URL:-wss://relay.fricam.app}
+      EDGE_IDENTITY_FILE: /data/identity.json
+      FRIGATE_AUTH_URL: https://127.0.0.1:8971
+    volumes:
+      - fricam_edge_identity:/data
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=8m,mode=1777
+    healthcheck:
+      test:
+        - CMD
+        - /fricam-edge
+        - healthcheck
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  fricam_edge_identity:
