@@ -6,7 +6,7 @@ services:
     command:
       - sh
       - -c
-      - chown -R 65532:65532 /data 2>/dev/null || true; chmod 700 /data 2>/dev/null || true; test "$(stat -c %u /data)" = 65532
+      - test "$(stat -c %u /data)" = 65532 || { chown -R 65532:65532 /data && chmod 700 /data; }
     user: "0:0"
     network_mode: none
     restart: "no"
