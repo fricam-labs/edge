@@ -54,27 +54,30 @@ type viewBridge struct {
 	go2rtcURL string
 	source    string
 	offer     viewBridgeOffer
-	bootstrap []byte
+	bootstrap [][]byte
 	send      func(json.RawMessage)
 
-	mu                sync.Mutex
-	remote            *webrtc.PeerConnection
-	local             *webrtc.PeerConnection
-	localSocket       *websocket.Conn
-	pendingCandidates []webrtc.ICECandidateInit
-	closeOnce         sync.Once
-	packetsForwarded  atomic.Uint64
-	bytesForwarded    atomic.Uint64
-	localVideoSSRC    atomic.Uint32
-	startedAt         time.Time
-	remoteReady       chan struct{}
+	mu                 sync.Mutex
+	remote             *webrtc.PeerConnection
+	local              *webrtc.PeerConnection
+	localSocket        *websocket.Conn
+	pendingCandidates  []webrtc.ICECandidateInit
+	closeOnce          sync.Once
+	packetsForwarded   atomic.Uint64
+	bytesForwarded     atomic.Uint64
+	localVideoSSRC     atomic.Uint32
+	startedAt          time.Time
+	remoteReady        chan struct{}
+	bootstrapSequence  atomic.Uint32
+	bootstrapTimestamp atomic.Uint32
+	bootstrapWritten   atomic.Bool
 }
 
 func newViewBridge(
 	parent context.Context,
 	go2rtcURL string,
 	source string,
-	bootstrap []byte,
+	bootstrap [][]byte,
 	offer viewBridgeOffer,
 	send func(json.RawMessage),
 ) *viewBridge {
@@ -147,6 +150,12 @@ func (b *viewBridge) start() error {
 	select {
 	case <-remoteConnected:
 		b.mark("remote_connected")
+		if b.writeBootstrap(video) {
+			b.mark("cached_gop_sent")
+			close(b.remoteReady)
+			b.mark("first_video_rtp")
+			return nil
+		}
 		close(b.remoteReady)
 	case <-ctx.Done():
 		return ctx.Err()
@@ -309,24 +318,39 @@ func (b *viewBridge) connectLocal(
 			}})
 		}
 		pending := make([]*rtp.Packet, 0, 128)
-		bootstrapSent := false
+		bootstrapReady := false
+		var inputBaseSequence uint16
+		var inputBaseTimestamp uint32
+		var outputBaseSequence uint16
+		var outputBaseTimestamp uint32
 		for {
 			packet, _, readErr := track.ReadRTP()
 			if readErr != nil {
 				return
 			}
-			if track.Kind() == webrtc.RTPCodecTypeVideo && !bootstrapSent {
+			if track.Kind() == webrtc.RTPCodecTypeVideo && !bootstrapReady {
 				select {
 				case <-b.remoteReady:
-					if len(b.bootstrap) > 0 {
-						b.writeBootstrap(destination, packet)
-						b.mark("cached_idr_sent")
+					clone := *packet
+					clone.Payload = append([]byte(nil), packet.Payload...)
+					pending = append(pending, &clone)
+					if b.bootstrapWritten.Load() && len(pending) > 0 {
+						inputBaseSequence = pending[0].SequenceNumber
+						inputBaseTimestamp = pending[0].Timestamp
+						outputBaseSequence = uint16(b.bootstrapSequence.Load())
+						outputBaseTimestamp = b.bootstrapTimestamp.Load()
 					}
 					for _, buffered := range pending {
+						if b.bootstrapWritten.Load() {
+							buffered.SequenceNumber = outputBaseSequence + (buffered.SequenceNumber - inputBaseSequence)
+							buffered.Timestamp = outputBaseTimestamp + (buffered.Timestamp - inputBaseTimestamp)
+						}
 						_ = destination.WriteRTP(buffered)
 					}
 					pending = nil
-					bootstrapSent = true
+					bootstrapReady = true
+					firstVideoOnce.Do(func() { close(firstVideo) })
+					continue
 				default:
 					clone := *packet
 					clone.Payload = append([]byte(nil), packet.Payload...)
@@ -337,6 +361,10 @@ func (b *viewBridge) connectLocal(
 					pending = append(pending, &clone)
 					continue
 				}
+			}
+			if track.Kind() == webrtc.RTPCodecTypeVideo && b.bootstrapWritten.Load() {
+				packet.SequenceNumber = outputBaseSequence + (packet.SequenceNumber - inputBaseSequence)
+				packet.Timestamp = outputBaseTimestamp + (packet.Timestamp - inputBaseTimestamp)
 			}
 			if writeErr := destination.WriteRTP(packet); writeErr != nil && !errors.Is(writeErr, io.ErrClosedPipe) {
 				return
@@ -394,18 +422,28 @@ func (b *viewBridge) connectLocal(
 	}
 }
 
-func (b *viewBridge) writeBootstrap(destination *webrtc.TrackLocalStaticRTP, next *rtp.Packet) {
-	packetizer := rtp.NewPacketizer(
-		1200, next.PayloadType, uint32(next.SSRC), &codecs.H264Payloader{},
-		rtp.NewFixedSequencer(next.SequenceNumber-64), 90000,
-	)
-	packets := packetizer.Packetize(b.bootstrap, 3000)
-	start := next.SequenceNumber - uint16(len(packets))
-	for index, packet := range packets {
-		packet.SequenceNumber = start + uint16(index)
-		packet.Timestamp = next.Timestamp - 3000
-		_ = destination.WriteRTP(packet)
+func (b *viewBridge) writeBootstrap(destination *webrtc.TrackLocalStaticRTP) bool {
+	if len(b.bootstrap) == 0 {
+		return false
 	}
+	packetizer := rtp.NewPacketizer(
+		1200, 96, 1, &codecs.H264Payloader{}, rtp.NewFixedSequencer(1), 90000,
+	)
+	var lastSequence uint16
+	var lastTimestamp uint32
+	for _, accessUnit := range b.bootstrap {
+		for _, packet := range packetizer.Packetize(accessUnit, 3000) {
+			if err := destination.WriteRTP(packet); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+				return false
+			}
+			lastSequence = packet.SequenceNumber
+			lastTimestamp = packet.Timestamp
+		}
+	}
+	b.bootstrapSequence.Store(uint32(lastSequence + 1))
+	b.bootstrapTimestamp.Store(lastTimestamp + 3000)
+	b.bootstrapWritten.Store(true)
+	return true
 }
 
 // Forward decoder keyframe requests from Android to the local go2rtc peer.

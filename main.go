@@ -671,22 +671,29 @@ func (s *streamCache) metrics() streamMetrics {
 	return result
 }
 
-func (s *streamCache) h264Bootstrap() []byte {
+func (s *streamCache) h264Bootstrap() [][]byte {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.codec != "h264" || len(s.cache) == 0 {
 		return nil
 	}
-	return extractFirstVideoPES(s.cache)
+	return extractVideoAccessUnits(s.cache)
 }
 
-// extractFirstVideoPES returns the Annex-B access unit at the start of the
-// cached GOP. streamCache.cache always starts with PAT/PMT followed by an IDR
-// PES, so this avoids waiting for the camera's next multi-second GOP remotely.
-func extractFirstVideoPES(ts []byte) []byte {
+// extractVideoAccessUnits returns every Annex-B video PES in the cached GOP.
+// Sending the complete GOP preserves the reference frames between its IDR and
+// the live RTP packets that follow it.
+func extractVideoAccessUnits(ts []byte) [][]byte {
 	parser := &tsParser{}
+	var result [][]byte
 	var accessUnit []byte
 	started := false
+	flush := func() {
+		if len(accessUnit) > 0 {
+			result = append(result, accessUnit)
+			accessUnit = nil
+		}
+	}
 	for offset := 0; offset+packetSize <= len(ts); offset += packetSize {
 		packet := ts[offset : offset+packetSize]
 		_, _, _ = parser.feed(packet)
@@ -695,33 +702,37 @@ func extractFirstVideoPES(ts []byte) []byte {
 			continue
 		}
 		pusi := packet[1]&0x40 != 0
-		if started && pusi {
-			break
-		}
 		payload, ok := tsPayload(packet)
 		if !ok {
 			continue
 		}
-		if !started {
-			if !pusi || len(payload) < 9 || payload[0] != 0 || payload[1] != 0 || payload[2] != 1 {
+		if pusi {
+			flush()
+			if len(payload) < 9 || payload[0] != 0 || payload[1] != 0 || payload[2] != 1 {
+				started = false
 				continue
 			}
 			headerEnd := 9 + int(payload[8])
 			if headerEnd >= len(payload) {
+				started = false
 				continue
 			}
 			payload = payload[headerEnd:]
 			started = true
 		}
+		if !started {
+			continue
+		}
 		accessUnit = append(accessUnit, payload...)
 	}
-	if !containsIDR(accessUnit, "h264") {
+	flush()
+	if len(result) == 0 || !containsIDR(result[0], "h264") {
 		return nil
 	}
-	return accessUnit
+	return result
 }
 
-func (m *streamManager) h264Bootstrap(requested string) []byte {
+func (m *streamManager) h264Bootstrap(requested string) [][]byte {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for camera, stream := range m.streams {
