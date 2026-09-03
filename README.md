@@ -5,11 +5,31 @@ Frigate servers.
 
 ## Install
 
-On the host running Frigate:
+On a Linux host with Docker Engine, Docker Compose v2, curl, and systemd:
 
 ```sh
-curl -fsSL https://fricam.app/edge/compose.yml | docker compose -f - up -d
+curl -fsSL https://github.com/fricam-labs/edge/releases/latest/download/install.sh | sudo sh
 ```
+
+The idempotent installer stores the Compose project in `/opt/fricam-edge`,
+deploys the current `stable` image, and enables a daily update timer with a
+randomized maintenance window. An update is accepted only after the container
+passes its health check; otherwise the previous local image is restored.
+
+Inspect or trigger updates with:
+
+```sh
+systemctl status fricam-edge-update.timer
+sudo systemctl start fricam-edge-update.service
+journalctl -u fricam-edge-update.service
+```
+
+For a NAS or another host without systemd, download `compose.yml` and
+`update.sh` from the latest GitHub release, store them together, and run
+`update.sh` from that platform's scheduler. The standard manual Compose update
+remains `docker compose pull fricam-edge && docker compose up -d --no-build`.
+Watchtower is intentionally not bundled: it is unmaintained and would give a
+general-purpose container access to the Docker daemon.
 
 Then select that server profile in Fricam and open **Settings → Fricam Edge**.
 Run one Edge instance beside each Frigate server. Fricam stores pairing material

@@ -20,6 +20,7 @@ jobs:
         with:
           go-version: '1.25.x'
           cache: true
+      - run: ./update_test.sh
       - run: go test -race ./...
 
   publish:
@@ -54,3 +55,15 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+      - name: Upload verified installation assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          asset_dir="${RUNNER_TEMP}/fricam-edge-assets"
+          mkdir -p "${asset_dir}"
+          cp install.sh compose.yml update.sh \
+            systemd/fricam-edge-update.service \
+            systemd/fricam-edge-update.timer "${asset_dir}/"
+          (cd "${asset_dir}" && sha256sum compose.yml update.sh \
+            fricam-edge-update.service fricam-edge-update.timer > SHA256SUMS)
+          gh release upload "${GITHUB_REF_NAME}" "${asset_dir}"/* --clobber

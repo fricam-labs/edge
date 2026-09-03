@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily Fricam Edge stable-channel update check
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+RandomizedDelaySec=6h
+Persistent=true
+AccuracySec=15min
+Unit=fricam-edge-update.service
+
+[Install]
+WantedBy=timers.target

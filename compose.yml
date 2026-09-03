@@ -23,7 +23,6 @@ services:
 
   fricam-edge:
     image: ghcr.io/fricam-labs/edge:stable
-    build: .
     container_name: fricam-edge
     restart: unless-stopped
     depends_on:
