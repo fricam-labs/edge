@@ -493,11 +493,8 @@ func (b *viewBridge) writeBootstrap(destination *webrtc.TrackLocalStaticRTP) boo
 	b.mediaWriteMu.Lock()
 	defer b.mediaWriteMu.Unlock()
 	for _, accessUnit := range bootstrap {
-		for _, payload := range payloader.Payload(1200, accessUnit) {
-			packet := &rtp.Packet{Header: rtp.Header{
-				Version: 2, PayloadType: 96, SequenceNumber: sequence,
-				Timestamp: timestamp, SSRC: 1,
-			}, Payload: payload}
+		packets := packetizeBootstrapAccessUnit(payloader, accessUnit, sequence, timestamp)
+		for _, packet := range packets {
 			if err := destination.WriteRTP(packet); err != nil && !errors.Is(err, io.ErrClosedPipe) {
 				return false
 			}
@@ -509,6 +506,23 @@ func (b *viewBridge) writeBootstrap(destination *webrtc.TrackLocalStaticRTP) boo
 	b.bootstrapTimestamp.Store(timestamp)
 	b.bootstrapWritten.Store(true)
 	return true
+}
+
+func packetizeBootstrapAccessUnit(
+	payloader *codecs.H264Payloader,
+	accessUnit []byte,
+	sequence uint16,
+	timestamp uint32,
+) []*rtp.Packet {
+	payloads := payloader.Payload(1200, accessUnit)
+	packets := make([]*rtp.Packet, 0, len(payloads))
+	for index, payload := range payloads {
+		packets = append(packets, &rtp.Packet{Header: rtp.Header{
+			Version: 2, PayloadType: 96, SequenceNumber: sequence + uint16(index),
+			Timestamp: timestamp, SSRC: 1, Marker: index == len(payloads)-1,
+		}, Payload: payload})
+	}
+	return packets
 }
 
 func (b *viewBridge) setPaused(paused bool) {
