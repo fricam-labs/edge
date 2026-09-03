@@ -57,24 +57,87 @@ type viewBridge struct {
 	bootstrap func() [][]byte
 	send      func(json.RawMessage)
 
-	mu                 sync.Mutex
-	mediaWriteMu       sync.Mutex
-	remote             *webrtc.PeerConnection
-	local              *webrtc.PeerConnection
-	localSocket        *websocket.Conn
-	video              *webrtc.TrackLocalStaticRTP
-	audio              *webrtc.TrackLocalStaticRTP
-	pendingCandidates  []webrtc.ICECandidateInit
-	closeOnce          sync.Once
-	packetsForwarded   atomic.Uint64
-	bytesForwarded     atomic.Uint64
-	localVideoSSRC     atomic.Uint32
-	startedAt          time.Time
-	remoteReady        chan struct{}
-	bootstrapSequence  atomic.Uint32
-	bootstrapTimestamp atomic.Uint32
-	bootstrapWritten   atomic.Bool
-	paused             atomic.Bool
+	mu                sync.Mutex
+	mediaWriteMu      sync.Mutex
+	remote            *webrtc.PeerConnection
+	local             *webrtc.PeerConnection
+	localSocket       *websocket.Conn
+	video             *webrtc.TrackLocalStaticRTP
+	audio             *webrtc.TrackLocalStaticRTP
+	pendingCandidates []webrtc.ICECandidateInit
+	closeOnce         sync.Once
+	packetsForwarded  atomic.Uint64
+	bytesForwarded    atomic.Uint64
+	localVideoSSRC    atomic.Uint32
+	startedAt         time.Time
+	remoteReady       chan struct{}
+	bootstrapWritten  atomic.Bool
+	paused            atomic.Bool
+	videoContinuity   videoRTPContinuity
+}
+
+// videoRTPContinuity owns the RTP timeline sent to Android. Local go2rtc
+// packets keep arriving while a warm session is paused, so forwarding their
+// original sequence/timestamp after a cached GOP would create a large gap.
+// Rebase every live epoch immediately after the last emitted bootstrap frame.
+// All access is protected by viewBridge.mediaWriteMu.
+type videoRTPContinuity struct {
+	initialized         bool
+	inputReady          bool
+	nextSequence        uint16
+	nextTimestamp       uint32
+	lastInputTimestamp  uint32
+	lastOutputTimestamp uint32
+	timestampStep       uint32
+}
+
+func (c *videoRTPContinuity) rewriteLive(packet *rtp.Packet) {
+	inputTimestamp := packet.Timestamp
+	if !c.initialized {
+		c.initialized = true
+		c.nextSequence = packet.SequenceNumber
+		c.nextTimestamp = packet.Timestamp
+		c.timestampStep = 3000
+	}
+	outputTimestamp := c.nextTimestamp
+	if c.inputReady {
+		delta := inputTimestamp - c.lastInputTimestamp
+		if delta == 0 {
+			outputTimestamp = c.lastOutputTimestamp
+		} else {
+			outputTimestamp = c.lastOutputTimestamp + delta
+			// Ignore implausible discontinuities when learning frame cadence.
+			if delta < 90000 {
+				c.timestampStep = delta
+			}
+		}
+	}
+	packet.SequenceNumber = c.nextSequence
+	packet.Timestamp = outputTimestamp
+	c.nextSequence++
+	c.lastInputTimestamp = inputTimestamp
+	c.lastOutputTimestamp = outputTimestamp
+	c.inputReady = true
+	c.nextTimestamp = outputTimestamp + c.timestampStep
+}
+
+func (c *videoRTPContinuity) beginBootstrap() (uint16, uint32) {
+	if !c.initialized {
+		c.initialized = true
+		c.nextSequence = 1
+		c.nextTimestamp = 1
+		c.timestampStep = 3000
+	}
+	return c.nextSequence, c.nextTimestamp
+}
+
+func (c *videoRTPContinuity) finishBootstrap(nextSequence uint16, nextTimestamp uint32) {
+	c.nextSequence = nextSequence
+	c.nextTimestamp = nextTimestamp
+	// The next local packet belongs to a new live epoch. Its input timestamp
+	// must be anchored to nextTimestamp rather than compared with packets that
+	// were discarded while paused.
+	c.inputReady = false
 }
 
 func newViewBridge(
@@ -344,10 +407,6 @@ func (b *viewBridge) connectLocal(
 			}})
 		}
 		bootstrapReady := false
-		var inputBaseSequence uint16
-		var inputBaseTimestamp uint32
-		var outputBaseSequence uint16
-		var outputBaseTimestamp uint32
 		for {
 			packet, _, readErr := track.ReadRTP()
 			if readErr != nil {
@@ -363,12 +422,6 @@ func (b *viewBridge) connectLocal(
 			if track.Kind() == webrtc.RTPCodecTypeVideo && !bootstrapReady {
 				select {
 				case <-b.remoteReady:
-					if b.bootstrapWritten.Load() {
-						inputBaseSequence = packet.SequenceNumber
-						inputBaseTimestamp = packet.Timestamp
-						outputBaseSequence = uint16(b.bootstrapSequence.Load())
-						outputBaseTimestamp = b.bootstrapTimestamp.Load()
-					}
 					bootstrapReady = true
 				default:
 					// The cache is sampled only after remote ICE connects, so these
@@ -376,11 +429,10 @@ func (b *viewBridge) connectLocal(
 					continue
 				}
 			}
-			if track.Kind() == webrtc.RTPCodecTypeVideo && b.bootstrapWritten.Load() {
-				packet.SequenceNumber = outputBaseSequence + (packet.SequenceNumber - inputBaseSequence)
-				packet.Timestamp = outputBaseTimestamp + (packet.Timestamp - inputBaseTimestamp)
-			}
 			b.mediaWriteMu.Lock()
+			if track.Kind() == webrtc.RTPCodecTypeVideo {
+				b.videoContinuity.rewriteLive(packet)
+			}
 			writeErr := destination.WriteRTP(packet)
 			b.mediaWriteMu.Unlock()
 			if writeErr != nil && !errors.Is(writeErr, io.ErrClosedPipe) {
@@ -483,15 +535,10 @@ func (b *viewBridge) writeBootstrap(destination *webrtc.TrackLocalStaticRTP) boo
 	if len(bootstrap) == 0 {
 		return false
 	}
-	sequence := uint16(1)
-	timestamp := uint32(1)
-	if b.bootstrapWritten.Load() {
-		sequence = uint16(b.bootstrapSequence.Load())
-		timestamp = b.bootstrapTimestamp.Load()
-	}
 	payloader := &codecs.H264Payloader{}
 	b.mediaWriteMu.Lock()
 	defer b.mediaWriteMu.Unlock()
+	sequence, timestamp := b.videoContinuity.beginBootstrap()
 	for _, accessUnit := range bootstrap {
 		packets := packetizeBootstrapAccessUnit(payloader, accessUnit, sequence, timestamp)
 		for _, packet := range packets {
@@ -502,8 +549,7 @@ func (b *viewBridge) writeBootstrap(destination *webrtc.TrackLocalStaticRTP) boo
 		}
 		timestamp += 3000
 	}
-	b.bootstrapSequence.Store(uint32(sequence))
-	b.bootstrapTimestamp.Store(timestamp)
+	b.videoContinuity.finishBootstrap(sequence, timestamp)
 	b.bootstrapWritten.Store(true)
 	return true
 }
