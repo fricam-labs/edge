@@ -50,18 +50,3 @@ jobs:
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-      - name: Keep the installation image public
-        if: github.event_name != 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          for attempt in {1..18}; do
-            if gh api --method PATCH \
-              "/orgs/${{ github.repository_owner }}/packages/container/edge" \
-              -f visibility=public; then
-              exit 0
-            fi
-            echo "Package metadata is not ready yet (attempt $attempt/18)."
-            sleep 10
-          done
-          exit 1
