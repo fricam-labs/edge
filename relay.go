@@ -438,7 +438,7 @@ func (r *relayController) writeLocalSignal(id string, payload json.RawMessage) {
 						return r.manager.h264Bootstrap(source)
 					}); err != nil {
 						log.Printf("edge view switch camera=%s failed: %v", control.Value, err)
-						r.send(relayEnvelope{SessionID: id, Payload: json.RawMessage(`{"type":"error","value":"stream unavailable"}`)})
+						r.send(relayEnvelope{SessionID: id, Payload: json.RawMessage(`{"type":"edge/source-error","value":"stream unavailable"}`)})
 						return
 					}
 					ready, _ := json.Marshal(map[string]string{"type": "edge/source-ready", "value": control.Value})

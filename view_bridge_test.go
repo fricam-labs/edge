@@ -25,6 +25,28 @@ func TestH264BootstrapPayloadEndsWithMarker(t *testing.T) {
 	}
 }
 
+func TestH264RTPStartsIDROnDecoderSafeBoundaries(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload []byte
+		want    bool
+	}{
+		{"single IDR", []byte{0x65, 0x01}, true},
+		{"single P frame", []byte{0x41, 0x01}, false},
+		{"FU-A IDR start", []byte{0x7c, 0x85, 0x01}, true},
+		{"FU-A IDR continuation", []byte{0x7c, 0x05, 0x01}, false},
+		{"STAP-A containing IDR", []byte{0x78, 0, 2, 0x65, 0x01}, true},
+		{"truncated STAP-A", []byte{0x78, 0, 9, 0x65}, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := h264RTPStartsIDR(test.payload); got != test.want {
+				t.Fatalf("h264RTPStartsIDR() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestVideoRTPContinuityRebasesLiveAfterEachBootstrap(t *testing.T) {
 	var continuity videoRTPContinuity
 	sequence, timestamp := continuity.beginBootstrap()

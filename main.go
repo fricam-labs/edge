@@ -742,13 +742,18 @@ func (m *streamManager) h264Bootstrap(requested string) [][]byte {
 		if requested == camera {
 			return stream.h264Bootstrap()
 		}
+		current := stream.sourceName()
 		for _, source := range stream.sourceNames {
-			if requested == source {
+			if requested == source && cachedSourceMatches(requested, camera, current) {
 				return stream.h264Bootstrap()
 			}
 		}
 	}
 	return nil
+}
+
+func cachedSourceMatches(requested, camera, cachedSource string) bool {
+	return requested == camera || requested == cachedSource
 }
 
 func (s *streamCache) serve(w http.ResponseWriter, r *http.Request) {

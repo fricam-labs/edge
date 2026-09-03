@@ -39,6 +39,18 @@ func TestContainsIDR(t *testing.T) {
 	}
 }
 
+func TestCachedBootstrapIsNeverBorrowedFromAnotherQuality(t *testing.T) {
+	if cachedSourceMatches("front_sub", "front", "front_main") {
+		t.Fatal("sub request matched the main-stream cache")
+	}
+	if !cachedSourceMatches("front_main", "front", "front_main") {
+		t.Fatal("main request did not match its cache")
+	}
+	if !cachedSourceMatches("front", "front", "front_main") {
+		t.Fatal("canonical camera request did not match its configured cache")
+	}
+}
+
 func TestH264RTPStartsIDR(t *testing.T) {
 	tests := []struct {
 		name    string
