@@ -58,9 +58,12 @@ type viewBridge struct {
 	send      func(json.RawMessage)
 
 	mu                 sync.Mutex
+	mediaWriteMu       sync.Mutex
 	remote             *webrtc.PeerConnection
 	local              *webrtc.PeerConnection
 	localSocket        *websocket.Conn
+	video              *webrtc.TrackLocalStaticRTP
+	audio              *webrtc.TrackLocalStaticRTP
 	pendingCandidates  []webrtc.ICECandidateInit
 	closeOnce          sync.Once
 	packetsForwarded   atomic.Uint64
@@ -71,6 +74,7 @@ type viewBridge struct {
 	bootstrapSequence  atomic.Uint32
 	bootstrapTimestamp atomic.Uint32
 	bootstrapWritten   atomic.Bool
+	paused             atomic.Bool
 }
 
 func newViewBridge(
@@ -90,7 +94,10 @@ func newViewBridge(
 }
 
 func (b *viewBridge) mark(phase string) {
-	log.Printf("edge view timing source=%s phase=%s elapsed_ms=%d", b.source, phase, time.Since(b.startedAt).Milliseconds())
+	b.mu.Lock()
+	source := b.source
+	b.mu.Unlock()
+	log.Printf("edge view timing source=%s phase=%s elapsed_ms=%d", source, phase, time.Since(b.startedAt).Milliseconds())
 }
 
 func mediaAPI() (*webrtc.API, error) {
@@ -139,6 +146,9 @@ func (b *viewBridge) start() error {
 	if err != nil {
 		return err
 	}
+	b.mu.Lock()
+	b.video, b.audio = video, audio
+	b.mu.Unlock()
 	remoteConnected, err := b.connectRemote(ctx, video, audio)
 	if err != nil {
 		return fmt.Errorf("remote WebRTC: %w", err)
@@ -354,7 +364,13 @@ func (b *viewBridge) connectLocal(
 				packet.SequenceNumber = outputBaseSequence + (packet.SequenceNumber - inputBaseSequence)
 				packet.Timestamp = outputBaseTimestamp + (packet.Timestamp - inputBaseTimestamp)
 			}
-			if writeErr := destination.WriteRTP(packet); writeErr != nil && !errors.Is(writeErr, io.ErrClosedPipe) {
+			if b.paused.Load() {
+				continue
+			}
+			b.mediaWriteMu.Lock()
+			writeErr := destination.WriteRTP(packet)
+			b.mediaWriteMu.Unlock()
+			if writeErr != nil && !errors.Is(writeErr, io.ErrClosedPipe) {
 				return
 			}
 			b.packetsForwarded.Add(1)
@@ -367,7 +383,10 @@ func (b *viewBridge) connectLocal(
 			}
 		}
 	})
-	query := url.Values{"src": []string{b.source}}
+	b.mu.Lock()
+	source := b.source
+	b.mu.Unlock()
+	query := url.Values{"src": []string{source}}
 	endpoint := strings.NewReplacer("http://", "ws://", "https://", "wss://").Replace(b.go2rtcURL) +
 		"/api/ws?" + query.Encode()
 	socket, response, err := websocket.DefaultDialer.DialContext(ctx, endpoint, nil)
@@ -441,31 +460,85 @@ func (b *viewBridge) connectLocal(
 }
 
 func (b *viewBridge) writeBootstrap(destination *webrtc.TrackLocalStaticRTP) bool {
-	if b.bootstrap == nil {
+	b.mu.Lock()
+	provider := b.bootstrap
+	b.mu.Unlock()
+	if provider == nil {
 		return false
 	}
-	bootstrap := b.bootstrap()
+	bootstrap := provider()
 	if len(bootstrap) == 0 {
 		return false
 	}
-	packetizer := rtp.NewPacketizer(
-		1200, 96, 1, &codecs.H264Payloader{}, rtp.NewFixedSequencer(1), 90000,
-	)
-	var lastSequence uint16
-	var lastTimestamp uint32
+	sequence := uint16(1)
+	timestamp := uint32(1)
+	if b.bootstrapWritten.Load() {
+		sequence = uint16(b.bootstrapSequence.Load())
+		timestamp = b.bootstrapTimestamp.Load()
+	}
+	payloader := &codecs.H264Payloader{}
+	b.mediaWriteMu.Lock()
+	defer b.mediaWriteMu.Unlock()
 	for _, accessUnit := range bootstrap {
-		for _, packet := range packetizer.Packetize(accessUnit, 3000) {
+		for _, payload := range payloader.Payload(1200, accessUnit) {
+			packet := &rtp.Packet{Header: rtp.Header{
+				Version: 2, PayloadType: 96, SequenceNumber: sequence,
+				Timestamp: timestamp, SSRC: 1,
+			}, Payload: payload}
 			if err := destination.WriteRTP(packet); err != nil && !errors.Is(err, io.ErrClosedPipe) {
 				return false
 			}
-			lastSequence = packet.SequenceNumber
-			lastTimestamp = packet.Timestamp
+			sequence++
 		}
+		timestamp += 3000
 	}
-	b.bootstrapSequence.Store(uint32(lastSequence + 1))
-	b.bootstrapTimestamp.Store(lastTimestamp + 3000)
+	b.bootstrapSequence.Store(uint32(sequence))
+	b.bootstrapTimestamp.Store(timestamp)
 	b.bootstrapWritten.Store(true)
 	return true
+}
+
+func (b *viewBridge) setPaused(paused bool) {
+	if paused {
+		b.paused.Store(true)
+		return
+	}
+	b.mu.Lock()
+	video := b.video
+	b.mu.Unlock()
+	if video != nil {
+		_ = b.writeBootstrap(video)
+	}
+	b.paused.Store(false)
+}
+
+func (b *viewBridge) switchSource(source string, bootstrap func() [][]byte) error {
+	b.paused.Store(true)
+	b.mu.Lock()
+	oldLocal, oldSocket := b.local, b.localSocket
+	b.local, b.localSocket = nil, nil
+	b.source, b.bootstrap = source, bootstrap
+	video, audio := b.video, b.audio
+	b.mu.Unlock()
+	if oldSocket != nil {
+		_ = oldSocket.Close()
+	}
+	if oldLocal != nil {
+		_ = oldLocal.Close()
+	}
+	if video == nil || audio == nil {
+		return errors.New("remote tracks unavailable")
+	}
+	ctx, cancel := context.WithTimeout(b.ctx, 5*time.Second)
+	defer cancel()
+	if _, err := b.connectLocal(ctx, video, audio); err != nil {
+		return err
+	}
+	if !b.writeBootstrap(video) {
+		return errors.New("bootstrap unavailable")
+	}
+	b.paused.Store(false)
+	return nil
 }
 
 // Forward decoder keyframe requests from Android to the local go2rtc peer.

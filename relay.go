@@ -150,7 +150,10 @@ func (r *relayController) run(ctx context.Context) {
 
 func (r *relayController) connect(ctx context.Context) error {
 	endpoint := fmt.Sprintf("%s/edge/connect/%s", r.relayURL, r.identity.DeviceID)
-	header := http.Header{"Authorization": []string{"Bearer " + r.identity.RootSecret}}
+	header := http.Header{
+		"Authorization":         []string{"Bearer " + r.identity.RootSecret},
+		"X-Fricam-Edge-Version": []string{version},
+	}
 	conn, response, err := websocket.DefaultDialer.DialContext(ctx, endpoint, header)
 	if err != nil {
 		if response != nil {
@@ -407,6 +410,39 @@ func (r *relayController) writeLocalSignal(id string, payload json.RawMessage) {
 			log.Printf("edge signal client->go2rtc camera=%s type=%s candidate=%s", session.camera, kind, candidateType)
 		}
 		session.writeMu.Lock()
+		var control struct {
+			Type  string `json:"type"`
+			Value string `json:"value"`
+		}
+		if json.Unmarshal(payload, &control) == nil && session.view != nil {
+			switch control.Type {
+			case "edge/pause":
+				session.view.setPaused(true)
+				session.writeMu.Unlock()
+				return
+			case "edge/resume":
+				session.view.setPaused(false)
+				session.writeMu.Unlock()
+				return
+			case "edge/source":
+				source, valid := r.manager.signalingSource(control.Value)
+				if !valid {
+					session.writeMu.Unlock()
+					r.send(relayEnvelope{SessionID: id, Payload: json.RawMessage(`{"type":"error","value":"camera unavailable"}`)})
+					return
+				}
+				session.camera, session.source = control.Value, source
+				session.writeMu.Unlock()
+				go func() {
+					if err := session.view.switchSource(source, func() [][]byte {
+						return r.manager.h264Bootstrap(source)
+					}); err != nil {
+						log.Printf("edge view switch camera=%s failed: %v", control.Value, err)
+					}
+				}()
+				return
+			}
+		}
 		if session.talk != nil {
 			session.talk.addClientSignal(payload)
 			session.writeMu.Unlock()
