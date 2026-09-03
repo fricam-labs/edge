@@ -425,25 +425,14 @@ func (r *relayController) writeLocalSignal(id string, payload json.RawMessage) {
 				session.writeMu.Unlock()
 				return
 			case "edge/source":
-				source, valid := r.manager.signalingSource(control.Value)
-				if !valid {
-					session.writeMu.Unlock()
-					r.send(relayEnvelope{SessionID: id, Payload: json.RawMessage(`{"type":"error","value":"camera unavailable"}`)})
-					return
-				}
-				session.camera, session.source = control.Value, source
+				// Do not pause a healthy stream for an in-place quality change.
+				// Preparing the replacement go2rtc peer can take up to five seconds,
+				// which turns the attempted upgrade into a visible black screen. New
+				// clients open the preferred detail source directly; older clients
+				// recover immediately from this non-fatal response.
 				session.writeMu.Unlock()
-				go func() {
-					if err := session.view.switchSource(source, func() [][]byte {
-						return r.manager.h264Bootstrap(source)
-					}); err != nil {
-						log.Printf("edge view switch camera=%s failed: %v", control.Value, err)
-						r.send(relayEnvelope{SessionID: id, Payload: json.RawMessage(`{"type":"edge/source-error","value":"stream unavailable"}`)})
-						return
-					}
-					ready, _ := json.Marshal(map[string]string{"type": "edge/source-ready", "value": control.Value})
-					r.send(relayEnvelope{SessionID: id, Payload: ready})
-				}()
+				log.Printf("edge view switch camera=%s skipped: seamless upgrade disabled", control.Value)
+				r.send(relayEnvelope{SessionID: id, Payload: json.RawMessage(`{"type":"edge/source-error","value":"seamless upgrade unavailable"}`)})
 				return
 			}
 		}
