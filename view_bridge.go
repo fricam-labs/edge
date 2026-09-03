@@ -632,59 +632,6 @@ func (b *viewBridge) setPaused(paused bool) {
 	b.mark("warm_resumed")
 }
 
-func (b *viewBridge) switchSource(source string, bootstrap func() [][]byte) error {
-	// Never interrupt the active source for an upgrade that cannot start with a
-	// complete H.264 GOP. The cached IDR is the decoder-safe handoff boundary.
-	initialBootstrap := bootstrap()
-	if len(initialBootstrap) == 0 {
-		return errors.New("quality source has no cached keyframe")
-	}
-	b.paused.Store(true)
-	b.mu.Lock()
-	oldLocal, oldSocket := b.local, b.localSocket
-	oldSource, oldBootstrap := b.source, b.bootstrap
-	video, audio := b.video, b.audio
-	b.mu.Unlock()
-	if video == nil || audio == nil {
-		b.paused.Store(false)
-		return errors.New("remote tracks unavailable")
-	}
-	ctx, cancel := context.WithTimeout(b.ctx, 5*time.Second)
-	defer cancel()
-	if _, err := b.connectLocal(ctx, video, audio, source); err != nil {
-		b.mu.Lock()
-		b.local, b.localSocket = oldLocal, oldSocket
-		b.source, b.bootstrap = oldSource, oldBootstrap
-		b.mu.Unlock()
-		b.paused.Store(false)
-		return err
-	}
-	// New local signaling is ready. Only now retire the sub source and publish
-	// the new source metadata. The first provider call uses the exact GOP that
-	// was validated before preparation; later resumes sample the fresh cache.
-	var first atomic.Bool
-	b.mu.Lock()
-	b.source = source
-	b.bootstrap = func() [][]byte {
-		if first.CompareAndSwap(false, true) {
-			return initialBootstrap
-		}
-		return bootstrap()
-	}
-	b.mu.Unlock()
-	if oldSocket != nil {
-		_ = oldSocket.Close()
-	}
-	if oldLocal != nil {
-		_ = oldLocal.Close()
-	}
-	// Stay paused until Android has detached the old camera renderer and
-	// acknowledges readiness with edge/resume. That resume writes the cached
-	// GOP, so no frame from the previous source can flash on screen.
-	b.mark("warm_source_ready")
-	return nil
-}
-
 // Forward decoder keyframe requests from Android to the local go2rtc peer.
 // Dropping these messages makes first-frame latency depend on the camera GOP,
 // which can vary by several seconds even after ICE is already connected.

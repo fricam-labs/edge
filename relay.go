@@ -424,16 +424,6 @@ func (r *relayController) writeLocalSignal(id string, payload json.RawMessage) {
 				session.view.setPaused(false)
 				session.writeMu.Unlock()
 				return
-			case "edge/source":
-				// Do not pause a healthy stream for an in-place quality change.
-				// Preparing the replacement go2rtc peer can take up to five seconds,
-				// which turns the attempted upgrade into a visible black screen. New
-				// clients open the preferred detail source directly; older clients
-				// recover immediately from this non-fatal response.
-				session.writeMu.Unlock()
-				log.Printf("edge view switch camera=%s skipped: seamless upgrade disabled", control.Value)
-				r.send(relayEnvelope{SessionID: id, Payload: json.RawMessage(`{"type":"edge/source-error","value":"seamless upgrade unavailable"}`)})
-				return
 			}
 		}
 		if session.talk != nil {
