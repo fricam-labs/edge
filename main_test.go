@@ -248,6 +248,18 @@ func TestTalkBridgeOfferRequiresAudioOnlySendOnlyV2Offer(t *testing.T) {
 	}
 }
 
+func TestViewBridgeOfferRequiresVideo(t *testing.T) {
+	credential := strings.Repeat("a", 64)
+	payload := []byte(fmt.Sprintf(`{"type":"webrtc","value":{"type":"offer","sdp":"v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 102\r\na=recvonly\r\n","ice_servers":[{"urls":["turns:turn.cloudflare.com:443?transport=tcp"],"username":"%s","credential":"%s"}]}}`, credential, credential))
+	if _, ok := parseViewBridgeOffer(payload); !ok {
+		t.Fatal("valid video offer was rejected")
+	}
+	audioOnly := []byte(strings.Replace(string(payload), "m=video", "m=audio", 1))
+	if _, ok := parseViewBridgeOffer(audioOnly); ok {
+		t.Fatal("audio-only offer was accepted as a view bridge")
+	}
+}
+
 func TestSignalingSourceAllowsOnlyConfiguredStreamsAndTalkVariants(t *testing.T) {
 	manager := &streamManager{streams: map[string]*streamCache{
 		"front": {sourceNames: []string{"front_main", "front_sub"}},

@@ -118,7 +118,7 @@ func pcmaAPI() (*webrtc.API, error) {
 	}, webrtc.RTPCodecTypeAudio); err != nil {
 		return nil, err
 	}
-	return webrtc.NewAPI(webrtc.WithMediaEngine(mediaEngine)), nil
+	return newWebRTCAPI(mediaEngine)
 }
 
 func (b *talkBridge) connectLocal(ctx context.Context, track *webrtc.TrackLocalStaticRTP) error {
@@ -270,7 +270,9 @@ func (b *talkBridge) connectRemote(ctx context.Context, localTrack *webrtc.Track
 			Credential: server.Credential, CredentialType: webrtc.ICECredentialTypePassword,
 		})
 	}
-	peer, err := api.NewPeerConnection(webrtc.Configuration{ICEServers: servers})
+	configuration := edgePeerConfiguration(b.offer.ICEServers)
+	configuration.ICEServers = servers
+	peer, err := api.NewPeerConnection(configuration)
 	if err != nil {
 		return err
 	}
@@ -317,14 +319,25 @@ func (b *talkBridge) connectRemote(ctx context.Context, localTrack *webrtc.Track
 	if err != nil {
 		return err
 	}
-	gathering := webrtc.GatheringCompletePromise(peer)
+	answerSent := atomic.Bool{}
+	var candidateMu sync.Mutex
+	pendingLocal := make([]string, 0, 8)
+	peer.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+		if candidate == nil {
+			return
+		}
+		value := candidate.ToJSON().Candidate
+		candidateMu.Lock()
+		if !answerSent.Load() {
+			pendingLocal = append(pendingLocal, value)
+			candidateMu.Unlock()
+			return
+		}
+		candidateMu.Unlock()
+		b.sendSignal("webrtc/candidate", value)
+	})
 	if err := peer.SetLocalDescription(answer); err != nil {
 		return err
-	}
-	select {
-	case <-gathering:
-	case <-ctx.Done():
-		return ctx.Err()
 	}
 	payload, err := json.Marshal(map[string]interface{}{
 		"type":  "webrtc",
@@ -334,6 +347,14 @@ func (b *talkBridge) connectRemote(ctx context.Context, localTrack *webrtc.Track
 		return err
 	}
 	b.send(payload)
+	candidateMu.Lock()
+	answerSent.Store(true)
+	queued := append([]string(nil), pendingLocal...)
+	pendingLocal = nil
+	candidateMu.Unlock()
+	for _, candidate := range queued {
+		b.sendSignal("webrtc/candidate", candidate)
+	}
 	select {
 	case <-trackStarted:
 		return nil
@@ -341,6 +362,13 @@ func (b *talkBridge) connectRemote(ctx context.Context, localTrack *webrtc.Track
 		return err
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+func (b *talkBridge) sendSignal(kind, value string) {
+	payload, err := json.Marshal(map[string]string{"type": kind, "value": value})
+	if err == nil {
+		b.send(payload)
 	}
 }
 

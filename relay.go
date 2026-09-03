@@ -26,6 +26,11 @@ import (
 
 const clientTokenContext = "fricam-edge-client-v1"
 
+const (
+	relayPingInterval = 30 * time.Second
+	relayPongTimeout  = 65 * time.Second
+)
+
 type edgeIdentity struct {
 	DeviceID    string `json:"device_id"`
 	RootSecret  string `json:"root_secret"`
@@ -100,6 +105,7 @@ type relayMediaSession struct {
 	ctx     context.Context
 	conn    *websocket.Conn
 	talk    *talkBridge
+	view    *viewBridge
 	cancel  context.CancelFunc
 	writeMu sync.Mutex
 }
@@ -153,11 +159,37 @@ func (r *relayController) connect(ctx context.Context) error {
 		return err
 	}
 	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(relayPongTimeout))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(relayPongTimeout))
+	})
 	r.mu.Lock()
 	r.conn = conn
 	r.mu.Unlock()
 	r.connected.Store(true)
 	log.Printf("edge relay connected; device=%s", r.identity.DeviceID[:8])
+	pingDone := make(chan struct{})
+	defer close(pingDone)
+	go func() {
+		ticker := time.NewTicker(relayPingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-pingDone:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				r.writeMu.Lock()
+				err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
+				r.writeMu.Unlock()
+				if err != nil {
+					_ = conn.Close()
+					return
+				}
+			}
+		}
+	}()
 	for {
 		_, raw, err := conn.ReadMessage()
 		if err != nil {
@@ -380,6 +412,11 @@ func (r *relayController) writeLocalSignal(id string, payload json.RawMessage) {
 			session.writeMu.Unlock()
 			return
 		}
+		if session.view != nil {
+			session.view.addClientSignal(payload)
+			session.writeMu.Unlock()
+			return
+		}
 		if offer, ok := parseTalkBridgeOffer(payload); ok && strings.HasSuffix(session.source, "_talk") {
 			bridge := newTalkBridge(session.ctx, r.go2rtcURL, session.source, offer, func(signal json.RawMessage) {
 				r.send(relayEnvelope{SessionID: id, Payload: signal})
@@ -394,6 +431,23 @@ func (r *relayController) writeLocalSignal(id string, payload json.RawMessage) {
 					return
 				}
 				log.Printf("edge talk bridge connected camera=%s", session.camera)
+			}()
+			return
+		}
+		if offer, ok := parseViewBridgeOffer(payload); ok {
+			bridge := newViewBridge(session.ctx, r.go2rtcURL, session.source, offer, func(signal json.RawMessage) {
+				r.send(relayEnvelope{SessionID: id, Payload: signal})
+			})
+			session.view = bridge
+			session.writeMu.Unlock()
+			go func() {
+				if err := bridge.start(); err != nil {
+					log.Printf("edge view bridge camera=%s failed: %v", session.camera, err)
+					r.send(relayEnvelope{SessionID: id, Payload: json.RawMessage(`{"type":"error","value":"stream unavailable"}`)})
+					r.closeSession(id)
+					return
+				}
+				log.Printf("edge view bridge connected camera=%s", session.camera)
 			}()
 			return
 		}
@@ -537,6 +591,9 @@ func (r *relayController) closeSession(id string) {
 			log.Printf("edge talk bridge closed camera=%s packets=%d bytes=%d", session.camera, packets, bytes)
 			session.talk.close()
 		}
+		if session.view != nil {
+			session.view.close()
+		}
 		session.writeMu.Unlock()
 	}
 }
@@ -557,6 +614,11 @@ func (r *relayController) closeSessions() {
 			packets, bytes := session.talk.forwardedMedia()
 			log.Printf("edge talk bridge closed camera=%s packets=%d bytes=%d", session.camera, packets, bytes)
 			session.talk.close()
+		}
+		if session.view != nil {
+			packets, bytes := session.view.forwardedMedia()
+			log.Printf("edge view bridge closed camera=%s packets=%d bytes=%d", session.camera, packets, bytes)
+			session.view.close()
 		}
 		session.writeMu.Unlock()
 	}

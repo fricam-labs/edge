@@ -633,7 +633,12 @@ func (s *streamCache) consume() error {
 			copy(s.history, s.history[len(s.history)-historyKeep:])
 			s.history = s.history[:historyKeep]
 		}
-		s.signalLocked()
+		// Wake HTTP consumers in small transport batches instead of once per
+		// 188-byte packet. PUSI keeps PES/keyframe boundaries responsive while
+		// the bounded fallback prevents sparse streams from stalling.
+		if packet[1]&0x40 != 0 || s.sequence%32 == 0 {
+			s.signalLocked()
+		}
 		s.mu.Unlock()
 	}
 }
@@ -669,14 +674,28 @@ func (s *streamCache) serve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
-	s.mu.RLock()
-	snapshot := append([]byte(nil), s.cache...)
-	cursor := s.sequence
-	wakeup := s.wakeup
-	s.mu.RUnlock()
-	if len(snapshot) == 0 {
-		http.Error(w, "waiting for first keyframe", http.StatusServiceUnavailable)
-		return
+	var snapshot []byte
+	var cursor uint64
+	var wakeup chan struct{}
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	for len(snapshot) == 0 {
+		s.mu.RLock()
+		snapshot = append(snapshot[:0], s.cache...)
+		cursor = s.sequence
+		wakeup = s.wakeup
+		s.mu.RUnlock()
+		if len(snapshot) > 0 {
+			break
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-deadline.C:
+			http.Error(w, "waiting for first keyframe", http.StatusServiceUnavailable)
+			return
+		case <-wakeup:
+		}
 	}
 	s.clients.Add(1)
 	defer s.clients.Add(-1)
@@ -701,10 +720,17 @@ func (s *streamCache) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.RLock()
 		var packets []byte
-		for _, event := range s.history {
-			if event.seq > cursor {
-				packets = append(packets, event.data...)
-				cursor = event.seq
+		if len(s.history) > 0 {
+			first := s.history[0].seq
+			start := 0
+			if cursor >= first {
+				start = int(cursor-first) + 1
+			}
+			if start < len(s.history) {
+				for _, event := range s.history[start:] {
+					packets = append(packets, event.data...)
+				}
+				cursor = s.history[len(s.history)-1].seq
 			}
 		}
 		wakeup = s.wakeup
