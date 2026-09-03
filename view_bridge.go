@@ -54,7 +54,7 @@ type viewBridge struct {
 	go2rtcURL string
 	source    string
 	offer     viewBridgeOffer
-	bootstrap [][]byte
+	bootstrap func() [][]byte
 	send      func(json.RawMessage)
 
 	mu                 sync.Mutex
@@ -77,7 +77,7 @@ func newViewBridge(
 	parent context.Context,
 	go2rtcURL string,
 	source string,
-	bootstrap [][]byte,
+	bootstrap func() [][]byte,
 	offer viewBridgeOffer,
 	send func(json.RawMessage),
 ) *viewBridge {
@@ -153,7 +153,7 @@ func (b *viewBridge) start() error {
 		if b.writeBootstrap(video) {
 			b.mark("cached_gop_sent")
 			close(b.remoteReady)
-			b.mark("first_video_rtp")
+			b.mark("bootstrap_video_rtp")
 			return nil
 		}
 		close(b.remoteReady)
@@ -180,8 +180,15 @@ func edgeICEServers(servers []edgeICEServer) []webrtc.ICEServer {
 	return result
 }
 
-func edgePeerConfiguration(servers []edgeICEServer) webrtc.Configuration {
-	configuration := webrtc.Configuration{ICEServers: edgeICEServers(servers)}
+func edgeViewPeerConfiguration(servers []edgeICEServer) webrtc.Configuration {
+	// Android remains relay-only for predictable cellular connectivity. Let the
+	// always-on Edge endpoint advertise host/srflx candidates so the selected
+	// pair needs only one TURN allocation instead of relaying both endpoints.
+	return webrtc.Configuration{ICEServers: edgeICEServers(servers)}
+}
+
+func edgeTalkPeerConfiguration(servers []edgeICEServer) webrtc.Configuration {
+	configuration := edgeViewPeerConfiguration(servers)
 	for _, server := range servers {
 		for _, candidateURL := range server.URLs {
 			if strings.HasPrefix(candidateURL, "turn:") || strings.HasPrefix(candidateURL, "turns:") {
@@ -202,7 +209,7 @@ func (b *viewBridge) connectRemote(
 	if err != nil {
 		return nil, err
 	}
-	peer, err := api.NewPeerConnection(edgePeerConfiguration(b.offer.ICEServers))
+	peer, err := api.NewPeerConnection(edgeViewPeerConfiguration(b.offer.ICEServers))
 	if err != nil {
 		return nil, err
 	}
@@ -317,7 +324,6 @@ func (b *viewBridge) connectLocal(
 				MediaSSRC: uint32(track.SSRC()),
 			}})
 		}
-		pending := make([]*rtp.Packet, 0, 128)
 		bootstrapReady := false
 		var inputBaseSequence uint16
 		var inputBaseTimestamp uint32
@@ -331,34 +337,16 @@ func (b *viewBridge) connectLocal(
 			if track.Kind() == webrtc.RTPCodecTypeVideo && !bootstrapReady {
 				select {
 				case <-b.remoteReady:
-					clone := *packet
-					clone.Payload = append([]byte(nil), packet.Payload...)
-					pending = append(pending, &clone)
-					if b.bootstrapWritten.Load() && len(pending) > 0 {
-						inputBaseSequence = pending[0].SequenceNumber
-						inputBaseTimestamp = pending[0].Timestamp
+					if b.bootstrapWritten.Load() {
+						inputBaseSequence = packet.SequenceNumber
+						inputBaseTimestamp = packet.Timestamp
 						outputBaseSequence = uint16(b.bootstrapSequence.Load())
 						outputBaseTimestamp = b.bootstrapTimestamp.Load()
 					}
-					for _, buffered := range pending {
-						if b.bootstrapWritten.Load() {
-							buffered.SequenceNumber = outputBaseSequence + (buffered.SequenceNumber - inputBaseSequence)
-							buffered.Timestamp = outputBaseTimestamp + (buffered.Timestamp - inputBaseTimestamp)
-						}
-						_ = destination.WriteRTP(buffered)
-					}
-					pending = nil
 					bootstrapReady = true
-					firstVideoOnce.Do(func() { close(firstVideo) })
-					continue
 				default:
-					clone := *packet
-					clone.Payload = append([]byte(nil), packet.Payload...)
-					if len(pending) == cap(pending) {
-						copy(pending, pending[len(pending)/2:])
-						pending = pending[:len(pending)-len(pending)/2]
-					}
-					pending = append(pending, &clone)
+					// The cache is sampled only after remote ICE connects, so these
+					// pre-ready packets are already represented in the fresh GOP.
 					continue
 				}
 			}
@@ -372,7 +360,10 @@ func (b *viewBridge) connectLocal(
 			b.packetsForwarded.Add(1)
 			b.bytesForwarded.Add(uint64(len(packet.Payload)))
 			if track.Kind() == webrtc.RTPCodecTypeVideo {
-				firstVideoOnce.Do(func() { close(firstVideo) })
+				firstVideoOnce.Do(func() {
+					b.mark("live_video_rtp")
+					close(firstVideo)
+				})
 			}
 		}
 	})
@@ -423,7 +414,11 @@ func (b *viewBridge) connectLocal(
 }
 
 func (b *viewBridge) writeBootstrap(destination *webrtc.TrackLocalStaticRTP) bool {
-	if len(b.bootstrap) == 0 {
+	if b.bootstrap == nil {
+		return false
+	}
+	bootstrap := b.bootstrap()
+	if len(bootstrap) == 0 {
 		return false
 	}
 	packetizer := rtp.NewPacketizer(
@@ -431,7 +426,7 @@ func (b *viewBridge) writeBootstrap(destination *webrtc.TrackLocalStaticRTP) boo
 	)
 	var lastSequence uint16
 	var lastTimestamp uint32
-	for _, accessUnit := range b.bootstrap {
+	for _, accessUnit := range bootstrap {
 		for _, packet := range packetizer.Packetize(accessUnit, 3000) {
 			if err := destination.WriteRTP(packet); err != nil && !errors.Is(err, io.ErrClosedPipe) {
 				return false

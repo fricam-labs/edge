@@ -270,7 +270,7 @@ func (b *talkBridge) connectRemote(ctx context.Context, localTrack *webrtc.Track
 			Credential: server.Credential, CredentialType: webrtc.ICECredentialTypePassword,
 		})
 	}
-	configuration := edgePeerConfiguration(b.offer.ICEServers)
+	configuration := edgeTalkPeerConfiguration(b.offer.ICEServers)
 	configuration.ICEServers = servers
 	peer, err := api.NewPeerConnection(configuration)
 	if err != nil {

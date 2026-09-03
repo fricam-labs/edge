@@ -435,7 +435,9 @@ func (r *relayController) writeLocalSignal(id string, payload json.RawMessage) {
 			return
 		}
 		if offer, ok := parseViewBridgeOffer(payload); ok {
-			bridge := newViewBridge(session.ctx, r.go2rtcURL, session.source, r.manager.h264Bootstrap(session.source), offer, func(signal json.RawMessage) {
+			bridge := newViewBridge(session.ctx, r.go2rtcURL, session.source, func() [][]byte {
+				return r.manager.h264Bootstrap(session.source)
+			}, offer, func(signal json.RawMessage) {
 				r.send(relayEnvelope{SessionID: id, Payload: signal})
 			})
 			session.view = bridge
