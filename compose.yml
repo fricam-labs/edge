@@ -1,3 +1,5 @@
+name: fricam-edge
+
 services:
   fricam-edge-identity-init:
     image: busybox:1.37.0

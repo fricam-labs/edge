@@ -154,6 +154,9 @@ func main() {
 		}
 		if relay != nil {
 			result["relay_connected"] = relay.connected.Load()
+			// Public identifier only: lets paired clients detect a reinstalled
+			// sidecar without exposing the root secret or client token.
+			result["device_id"] = relay.identity.DeviceID
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
