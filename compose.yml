@@ -22,7 +22,7 @@ services:
       - no-new-privileges:true
 
   fricam-edge:
-    image: ghcr.io/fricam-labs/edge:latest
+    image: ghcr.io/fricam-labs/edge:stable
     build: .
     container_name: fricam-edge
     restart: unless-stopped
