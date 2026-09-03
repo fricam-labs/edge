@@ -86,11 +86,15 @@ func newViewBridge(
 	send func(json.RawMessage),
 ) *viewBridge {
 	ctx, cancel := context.WithCancel(parent)
-	return &viewBridge{
+	bridge := &viewBridge{
 		ctx: ctx, cancel: cancel, go2rtcURL: go2rtcURL,
 		source: source, bootstrap: bootstrap, offer: offer, send: send, startedAt: time.Now(),
 		remoteReady: make(chan struct{}),
 	}
+	// Starting paused is part of the offer so it is applied before either peer
+	// can deliver media. A follow-up pause message would race the first GOP.
+	bridge.paused.Store(offer.WarmPaused)
+	return bridge
 }
 
 func (b *viewBridge) mark(phase string) {

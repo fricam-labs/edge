@@ -22,6 +22,7 @@ type talkBridgeOffer struct {
 	Type       string          `json:"type"`
 	SDP        string          `json:"sdp"`
 	ICEServers []edgeICEServer `json:"ice_servers"`
+	WarmPaused bool            `json:"warm_paused,omitempty"`
 }
 
 type talkBridge struct {
