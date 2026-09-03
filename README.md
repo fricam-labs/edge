@@ -41,18 +41,26 @@ Docker host networking to reach the loopback-only go2rtc API in the existing
 Frigate container. Do not port-forward 8099 to the public internet.
 
 For remote access it opens one outbound `wss://relay.fricam.app` control
-connection. The Worker forwards only SDP/ICE JSON to local go2rtc. Camera media
-stays end-to-end encrypted over direct WebRTC or Cloudflare TURN fallback; no
-Cloudflare Tunnel, inbound public port, or cloud media storage is used. Android
-pairs while on the LAN through `POST /pair`, whose Frigate bearer token is
-validated only against the private loopback Frigate HTTPS endpoint.
+connection. The Worker forwards only bounded SDP/ICE JSON. Camera media travels
+over DTLS-SRTP through a direct WebRTC path or Cloudflare TURN fallback; the
+Worker and TURN service cannot decrypt it. No Cloudflare Tunnel, inbound public
+port, or cloud media storage is used. Android pairs while on the LAN through
+`POST /pair`, whose Frigate bearer token is validated only against the private
+loopback Frigate HTTPS endpoint.
 
 Two-way audio uses the same Edge contract on every network. On the LAN the app
 opens the authenticated `/webrtc` WebSocket directly; away from home it opens
-the same go2rtc session through the managed relay and uses P2P first with TURN
-fallback. Only SDP/ICE signaling crosses Edge or the relay. Microphone audio is
-WebRTC encrypted end to end and is sent to the camera's go2rtc backchannel; it
-is never cached, recorded, or uploaded by Edge.
+the same logical session through the managed relay and uses P2P first with TURN
+fallback. For remote talk, the self-hosted Edge process terminates DTLS-SRTP and
+bridges PCMA RTP over loopback into the camera's go2rtc backchannel. This is
+required for TURN compatibility with go2rtc's fixed ICE listener. Cloudflare
+still sees only encrypted packets; plaintext audio exists only in the user's
+self-hosted Edge process and camera path. It is never cached, recorded, or sent
+to the Fricam Worker.
+
+`e2e/` contains the relay-only regression client used to verify the managed
+entitlement, Cloudflare TURN route, and a real `_talk` backchannel. It accepts
+the Personal Pro test entitlement only over stdin and never stores it.
 
 The runtime is a statically linked Go binary in a non-root distroless container.
 The image has no shell, package manager, Python runtime, or writable root filesystem.

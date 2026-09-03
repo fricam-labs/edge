@@ -226,6 +226,28 @@ func TestV2OfferOnlyAllowsCloudflareICEServers(t *testing.T) {
 	}
 }
 
+func TestTalkBridgeOfferRequiresAudioOnlySendOnlyV2Offer(t *testing.T) {
+	credential := strings.Repeat("a", 64)
+	payload := []byte(fmt.Sprintf(`{"type":"webrtc","value":{"type":"offer","sdp":"v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 8\r\na=sendonly\r\n","ice_servers":[{"urls":["turns:turn.cloudflare.com:443?transport=tcp"],"username":"%s","credential":"%s"}]}}`, credential, credential))
+	clean, ok := sanitizeSignalForGo2RTC(payload)
+	if !ok {
+		t.Fatal("valid talk offer was rejected by sanitizer")
+	}
+	if _, ok := parseTalkBridgeOffer(clean); !ok {
+		t.Fatal("valid audio-only sendonly offer did not select the talk bridge")
+	}
+
+	for _, sdp := range []string{
+		"v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 8\r\na=recvonly\r\n",
+		"v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 8\r\na=sendonly\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n",
+	} {
+		candidate := []byte(fmt.Sprintf(`{"type":"webrtc","value":{"type":"offer","sdp":%q,"ice_servers":[{"urls":["turns:turn.cloudflare.com:443?transport=tcp"],"username":"%s","credential":"%s"}]}}`, sdp, credential, credential))
+		if _, ok := parseTalkBridgeOffer(candidate); ok {
+			t.Fatalf("non-talk SDP selected the bridge: %q", sdp)
+		}
+	}
+}
+
 func TestSignalingSourceAllowsOnlyConfiguredStreamsAndTalkVariants(t *testing.T) {
 	manager := &streamManager{streams: map[string]*streamCache{
 		"front": {sourceNames: []string{"front_main", "front_sub"}},

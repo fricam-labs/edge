@@ -96,7 +96,10 @@ type relayEnvelope struct {
 type relayMediaSession struct {
 	id      string
 	camera  string
+	source  string
+	ctx     context.Context
 	conn    *websocket.Conn
+	talk    *talkBridge
 	cancel  context.CancelFunc
 	writeMu sync.Mutex
 }
@@ -186,23 +189,26 @@ func (r *relayController) openSession(parent context.Context, id, camera string)
 	}
 	r.closeSession(id)
 	ctx, cancel := context.WithCancel(parent)
-	query := url.Values{"src": []string{source}}
-	endpoint := strings.NewReplacer("http://", "ws://", "https://", "wss://").Replace(r.go2rtcURL) +
-		"/api/ws?" + query.Encode()
-	conn, response, err := websocket.DefaultDialer.DialContext(ctx, endpoint, nil)
-	if err != nil {
-		cancel()
-		if response != nil {
-			log.Printf("go2rtc signaling for %s returned %s", camera, response.Status)
-		}
-		r.send(relayEnvelope{SessionID: id, Payload: json.RawMessage(`{"type":"error","value":"stream unavailable"}`)})
-		return
-	}
-	session := &relayMediaSession{id: id, camera: camera, conn: conn, cancel: cancel}
+	session := &relayMediaSession{id: id, camera: camera, source: source, ctx: ctx, cancel: cancel}
 	r.mu.Lock()
 	r.sessions[id] = session
 	r.mu.Unlock()
+}
+
+func (r *relayController) openLocalSignaling(session *relayMediaSession) bool {
+	query := url.Values{"src": []string{session.source}}
+	endpoint := strings.NewReplacer("http://", "ws://", "https://", "wss://").Replace(r.go2rtcURL) +
+		"/api/ws?" + query.Encode()
+	conn, response, err := websocket.DefaultDialer.DialContext(session.ctx, endpoint, nil)
+	if err != nil {
+		if response != nil {
+			log.Printf("go2rtc signaling for %s returned %s", session.camera, response.Status)
+		}
+		return false
+	}
+	session.conn = conn
 	go r.readLocalSignals(session)
+	return true
 }
 
 // signalingSource limits WebRTC access to configured camera streams and their
@@ -369,6 +375,33 @@ func (r *relayController) writeLocalSignal(id string, payload json.RawMessage) {
 			log.Printf("edge signal client->go2rtc camera=%s type=%s candidate=%s", session.camera, kind, candidateType)
 		}
 		session.writeMu.Lock()
+		if session.talk != nil {
+			session.talk.addClientSignal(payload)
+			session.writeMu.Unlock()
+			return
+		}
+		if offer, ok := parseTalkBridgeOffer(payload); ok && strings.HasSuffix(session.source, "_talk") {
+			bridge := newTalkBridge(session.ctx, r.go2rtcURL, session.source, offer, func(signal json.RawMessage) {
+				r.send(relayEnvelope{SessionID: id, Payload: signal})
+			})
+			session.talk = bridge
+			session.writeMu.Unlock()
+			go func() {
+				if err := bridge.start(); err != nil {
+					log.Printf("edge talk bridge camera=%s failed: %v", session.camera, err)
+					r.send(relayEnvelope{SessionID: id, Payload: json.RawMessage(`{"type":"error","value":"talk unavailable"}`)})
+					r.closeSession(id)
+					return
+				}
+				log.Printf("edge talk bridge connected camera=%s", session.camera)
+			}()
+			return
+		}
+		if session.conn == nil && !r.openLocalSignaling(session) {
+			session.writeMu.Unlock()
+			r.send(relayEnvelope{SessionID: id, Payload: json.RawMessage(`{"type":"error","value":"stream unavailable"}`)})
+			return
+		}
 		_ = session.conn.WriteMessage(websocket.TextMessage, payload)
 		session.writeMu.Unlock()
 	}
@@ -496,7 +529,14 @@ func (r *relayController) closeSession(id string) {
 	if session != nil {
 		session.cancel()
 		session.writeMu.Lock()
-		_ = session.conn.Close()
+		if session.conn != nil {
+			_ = session.conn.Close()
+		}
+		if session.talk != nil {
+			packets, bytes := session.talk.forwardedMedia()
+			log.Printf("edge talk bridge closed camera=%s packets=%d bytes=%d", session.camera, packets, bytes)
+			session.talk.close()
+		}
 		session.writeMu.Unlock()
 	}
 }
@@ -510,7 +550,14 @@ func (r *relayController) closeSessions() {
 	for _, session := range sessions {
 		session.cancel()
 		session.writeMu.Lock()
-		_ = session.conn.Close()
+		if session.conn != nil {
+			_ = session.conn.Close()
+		}
+		if session.talk != nil {
+			packets, bytes := session.talk.forwardedMedia()
+			log.Printf("edge talk bridge closed camera=%s packets=%d bytes=%d", session.camera, packets, bytes)
+			session.talk.close()
+		}
 		session.writeMu.Unlock()
 	}
 }
