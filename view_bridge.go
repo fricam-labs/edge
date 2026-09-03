@@ -381,23 +381,50 @@ func (b *viewBridge) connectLocal(
 	b.mu.Lock()
 	b.localSocket = socket
 	b.mu.Unlock()
+	var socketWriteMu sync.Mutex
+	writeSignal := func(signal map[string]string) error {
+		socketWriteMu.Lock()
+		defer socketWriteMu.Unlock()
+		return socket.WriteJSON(signal)
+	}
+	offerSent := atomic.Bool{}
+	var candidateMu sync.Mutex
+	pendingLocal := make([]string, 0, 8)
+	peer.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+		if candidate == nil {
+			return
+		}
+		value := candidate.ToJSON().Candidate
+		candidateMu.Lock()
+		if !offerSent.Load() {
+			pendingLocal = append(pendingLocal, value)
+			candidateMu.Unlock()
+			return
+		}
+		candidateMu.Unlock()
+		_ = writeSignal(map[string]string{"type": "webrtc/candidate", "value": value})
+	})
 	offer, err := peer.CreateOffer(nil)
 	if err != nil {
 		return nil, err
 	}
-	gathering := webrtc.GatheringCompletePromise(peer)
 	if err := peer.SetLocalDescription(offer); err != nil {
 		return nil, err
 	}
-	select {
-	case <-gathering:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-	if err := socket.WriteJSON(map[string]string{
+	if err := writeSignal(map[string]string{
 		"type": "webrtc/offer", "value": peer.LocalDescription().SDP,
 	}); err != nil {
 		return nil, err
+	}
+	candidateMu.Lock()
+	offerSent.Store(true)
+	queued := append([]string(nil), pendingLocal...)
+	pendingLocal = nil
+	candidateMu.Unlock()
+	for _, candidate := range queued {
+		if err := writeSignal(map[string]string{"type": "webrtc/candidate", "value": candidate}); err != nil {
+			return nil, err
+		}
 	}
 	answerSet := make(chan struct{}, 1)
 	failed := make(chan error, 1)
