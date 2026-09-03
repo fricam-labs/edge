@@ -349,6 +349,13 @@ func (b *viewBridge) connectLocal(
 			if readErr != nil {
 				return
 			}
+			// During a warm source switch, wait until edge/resume has written the
+			// new source's cached GOP. Establishing the sequence/timestamp mapping
+			// while paused would anchor live packets to the previous camera and
+			// make Android reject the stream until it falls back to HD.
+			if b.paused.Load() {
+				continue
+			}
 			if track.Kind() == webrtc.RTPCodecTypeVideo && !bootstrapReady {
 				select {
 				case <-b.remoteReady:
@@ -368,9 +375,6 @@ func (b *viewBridge) connectLocal(
 			if track.Kind() == webrtc.RTPCodecTypeVideo && b.bootstrapWritten.Load() {
 				packet.SequenceNumber = outputBaseSequence + (packet.SequenceNumber - inputBaseSequence)
 				packet.Timestamp = outputBaseTimestamp + (packet.Timestamp - inputBaseTimestamp)
-			}
-			if b.paused.Load() {
-				continue
 			}
 			b.mediaWriteMu.Lock()
 			writeErr := destination.WriteRTP(packet)
