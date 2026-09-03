@@ -668,6 +668,72 @@ func (s *streamCache) metrics() streamMetrics {
 	return result
 }
 
+func (s *streamCache) h264Bootstrap() []byte {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.codec != "h264" || len(s.cache) == 0 {
+		return nil
+	}
+	return extractFirstVideoPES(s.cache)
+}
+
+// extractFirstVideoPES returns the Annex-B access unit at the start of the
+// cached GOP. streamCache.cache always starts with PAT/PMT followed by an IDR
+// PES, so this avoids waiting for the camera's next multi-second GOP remotely.
+func extractFirstVideoPES(ts []byte) []byte {
+	parser := &tsParser{}
+	var accessUnit []byte
+	started := false
+	for offset := 0; offset+packetSize <= len(ts); offset += packetSize {
+		packet := ts[offset : offset+packetSize]
+		_, _, _ = parser.feed(packet)
+		pid := uint16(packet[1]&0x1f)<<8 | uint16(packet[2])
+		if parser.videoPID == 0 || pid != parser.videoPID {
+			continue
+		}
+		pusi := packet[1]&0x40 != 0
+		if started && pusi {
+			break
+		}
+		payload, ok := tsPayload(packet)
+		if !ok {
+			continue
+		}
+		if !started {
+			if !pusi || len(payload) < 9 || payload[0] != 0 || payload[1] != 0 || payload[2] != 1 {
+				continue
+			}
+			headerEnd := 9 + int(payload[8])
+			if headerEnd >= len(payload) {
+				continue
+			}
+			payload = payload[headerEnd:]
+			started = true
+		}
+		accessUnit = append(accessUnit, payload...)
+	}
+	if !containsIDR(accessUnit, "h264") {
+		return nil
+	}
+	return accessUnit
+}
+
+func (m *streamManager) h264Bootstrap(requested string) []byte {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for camera, stream := range m.streams {
+		if requested == camera {
+			return stream.h264Bootstrap()
+		}
+		for _, source := range stream.sourceNames {
+			if requested == source {
+				return stream.h264Bootstrap()
+			}
+		}
+	}
+	return nil
+}
+
 func (s *streamCache) serve(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {

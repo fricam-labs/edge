@@ -16,6 +16,8 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
+	"github.com/pion/rtp"
+	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -52,6 +54,7 @@ type viewBridge struct {
 	go2rtcURL string
 	source    string
 	offer     viewBridgeOffer
+	bootstrap []byte
 	send      func(json.RawMessage)
 
 	mu                sync.Mutex
@@ -64,19 +67,22 @@ type viewBridge struct {
 	bytesForwarded    atomic.Uint64
 	localVideoSSRC    atomic.Uint32
 	startedAt         time.Time
+	remoteReady       chan struct{}
 }
 
 func newViewBridge(
 	parent context.Context,
 	go2rtcURL string,
 	source string,
+	bootstrap []byte,
 	offer viewBridgeOffer,
 	send func(json.RawMessage),
 ) *viewBridge {
 	ctx, cancel := context.WithCancel(parent)
 	return &viewBridge{
 		ctx: ctx, cancel: cancel, go2rtcURL: go2rtcURL,
-		source: source, offer: offer, send: send, startedAt: time.Now(),
+		source: source, bootstrap: bootstrap, offer: offer, send: send, startedAt: time.Now(),
+		remoteReady: make(chan struct{}),
 	}
 }
 
@@ -141,6 +147,7 @@ func (b *viewBridge) start() error {
 	select {
 	case <-remoteConnected:
 		b.mark("remote_connected")
+		close(b.remoteReady)
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -301,10 +308,35 @@ func (b *viewBridge) connectLocal(
 				MediaSSRC: uint32(track.SSRC()),
 			}})
 		}
+		pending := make([]*rtp.Packet, 0, 128)
+		bootstrapSent := false
 		for {
 			packet, _, readErr := track.ReadRTP()
 			if readErr != nil {
 				return
+			}
+			if track.Kind() == webrtc.RTPCodecTypeVideo && !bootstrapSent {
+				select {
+				case <-b.remoteReady:
+					if len(b.bootstrap) > 0 {
+						b.writeBootstrap(destination, packet)
+						b.mark("cached_idr_sent")
+					}
+					for _, buffered := range pending {
+						_ = destination.WriteRTP(buffered)
+					}
+					pending = nil
+					bootstrapSent = true
+				default:
+					clone := *packet
+					clone.Payload = append([]byte(nil), packet.Payload...)
+					if len(pending) == cap(pending) {
+						copy(pending, pending[len(pending)/2:])
+						pending = pending[:len(pending)-len(pending)/2]
+					}
+					pending = append(pending, &clone)
+					continue
+				}
 			}
 			if writeErr := destination.WriteRTP(packet); writeErr != nil && !errors.Is(writeErr, io.ErrClosedPipe) {
 				return
@@ -359,6 +391,20 @@ func (b *viewBridge) connectLocal(
 		return nil, err
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	}
+}
+
+func (b *viewBridge) writeBootstrap(destination *webrtc.TrackLocalStaticRTP, next *rtp.Packet) {
+	packetizer := rtp.NewPacketizer(
+		1200, next.PayloadType, uint32(next.SSRC), &codecs.H264Payloader{},
+		rtp.NewFixedSequencer(next.SequenceNumber-64), 90000,
+	)
+	packets := packetizer.Packetize(b.bootstrap, 3000)
+	start := next.SequenceNumber - uint16(len(packets))
+	for index, packet := range packets {
+		packet.SequenceNumber = start + uint16(index)
+		packet.Timestamp = next.Timestamp - 3000
+		_ = destination.WriteRTP(packet)
 	}
 }
 
