@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 func boolPtr(value bool) *bool { return &value }
@@ -221,5 +223,105 @@ func TestV2OfferOnlyAllowsCloudflareICEServers(t *testing.T) {
 	malicious := []byte(fmt.Sprintf(`{"type":"webrtc","value":{"type":"offer","sdp":"v=0","ice_servers":[{"urls":["turn:192.168.1.1:3478"],"username":"%s","credential":"%s"}]}}`, credential, credential))
 	if _, ok := sanitizeSignalForGo2RTC(malicious); ok {
 		t.Fatal("non-Cloudflare ICE server was accepted")
+	}
+}
+
+func TestSignalingSourceAllowsOnlyConfiguredStreamsAndTalkVariants(t *testing.T) {
+	manager := &streamManager{streams: map[string]*streamCache{
+		"front": {sourceNames: []string{"front_main", "front_sub"}},
+	}}
+	tests := map[string]string{
+		"front":           "front_main",
+		"front_main":      "front_main",
+		"front_talk":      "front_talk",
+		"front_main_talk": "front_main_talk",
+	}
+	for requested, expected := range tests {
+		actual, ok := manager.signalingSource(requested)
+		if !ok || actual != expected {
+			t.Fatalf("signalingSource(%q) = %q, %v; want %q", requested, actual, ok, expected)
+		}
+	}
+	for _, requested := range []string{"other", "other_talk", "front/main", "front?src=other", ""} {
+		if source, ok := manager.signalingSource(requested); ok {
+			t.Fatalf("signalingSource(%q) unexpectedly allowed %q", requested, source)
+		}
+	}
+}
+
+func TestLocalWebRTCAuthorizationRequiresPrivateNetworkAndClientToken(t *testing.T) {
+	identity := deriveIdentity("local-talk-root")
+	relay := &relayController{identity: identity}
+	request := httptest.NewRequest(http.MethodGet, "http://192.168.1.20:8099/webrtc?src=front", nil)
+	request.RemoteAddr = "192.168.1.50:4242"
+	request.Header.Set("Authorization", "Bearer "+identity.ClientToken)
+	if !relay.authorizeLocalClient(request) {
+		t.Fatal("valid paired LAN client was rejected")
+	}
+	request.RemoteAddr = "100.100.10.20:4242"
+	if !relay.authorizeLocalClient(request) {
+		t.Fatal("valid paired Tailscale client was rejected")
+	}
+	request.RemoteAddr = "203.0.113.20:4242"
+	if relay.authorizeLocalClient(request) {
+		t.Fatal("public client was accepted")
+	}
+	request.RemoteAddr = "192.168.1.50:4242"
+	request.Header.Set("Authorization", "Bearer wrong")
+	if relay.authorizeLocalClient(request) {
+		t.Fatal("invalid client token was accepted")
+	}
+}
+
+func TestLocalWebRTCProxiesPairedSignalingToGo2RTC(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	go2rtc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/ws" || request.URL.Query().Get("src") != "front_talk" {
+			http.Error(w, "wrong stream", http.StatusBadRequest)
+			return
+		}
+		connection, err := upgrader.Upgrade(w, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		messageType, payload, err := connection.ReadMessage()
+		if err != nil || messageType != websocket.TextMessage || !strings.Contains(string(payload), "webrtc/offer") {
+			return
+		}
+		_ = connection.WriteJSON(map[string]string{"type": "webrtc/answer", "value": "v=0"})
+	}))
+	defer go2rtc.Close()
+
+	identity := deriveIdentity("proxy-talk-root")
+	relay := &relayController{
+		go2rtcURL: go2rtc.URL,
+		identity:  identity,
+		manager: &streamManager{streams: map[string]*streamCache{
+			"front": {sourceNames: []string{"front_main"}},
+		}},
+	}
+	edge := httptest.NewServer(http.HandlerFunc(relay.serveLocalWebRTC))
+	defer edge.Close()
+
+	endpoint := "ws" + strings.TrimPrefix(edge.URL, "http") + "/webrtc?src=front_talk"
+	header := http.Header{"Authorization": []string{"Bearer " + identity.ClientToken}}
+	client, response, err := websocket.DefaultDialer.Dial(endpoint, header)
+	if err != nil {
+		if response != nil {
+			t.Fatalf("Edge WebSocket returned %s: %v", response.Status, err)
+		}
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if err := client.WriteJSON(map[string]string{"type": "webrtc/offer", "value": "v=0"}); err != nil {
+		t.Fatal(err)
+	}
+	var answer map[string]string
+	if err := client.ReadJSON(&answer); err != nil {
+		t.Fatal(err)
+	}
+	if answer["type"] != "webrtc/answer" || answer["value"] != "v=0" {
+		t.Fatalf("unexpected answer: %#v", answer)
 	}
 }

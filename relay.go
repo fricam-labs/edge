@@ -5,11 +5,13 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -99,6 +101,12 @@ type relayMediaSession struct {
 	writeMu sync.Mutex
 }
 
+const edgeMaxSignalBytes = 128 * 1024
+
+var localWebRTCUpgrader = websocket.Upgrader{
+	CheckOrigin: func(*http.Request) bool { return true },
+}
+
 func newRelayController(relayURL, go2rtcURL string, identity edgeIdentity, manager *streamManager) *relayController {
 	return &relayController{
 		relayURL: strings.TrimRight(relayURL, "/"), go2rtcURL: strings.TrimRight(go2rtcURL, "/"),
@@ -171,14 +179,14 @@ func (r *relayController) openSession(parent context.Context, id, camera string)
 	if id == "" || camera == "" {
 		return
 	}
-	stream := r.manager.get(camera)
-	if stream == nil {
+	source, ok := r.manager.signalingSource(camera)
+	if !ok {
 		r.send(relayEnvelope{SessionID: id, Payload: json.RawMessage(`{"type":"error","value":"camera unavailable"}`)})
 		return
 	}
 	r.closeSession(id)
 	ctx, cancel := context.WithCancel(parent)
-	query := url.Values{"src": []string{stream.sourceName()}}
+	query := url.Values{"src": []string{source}}
 	endpoint := strings.NewReplacer("http://", "ws://", "https://", "wss://").Replace(r.go2rtcURL) +
 		"/api/ws?" + query.Encode()
 	conn, response, err := websocket.DefaultDialer.DialContext(ctx, endpoint, nil)
@@ -195,6 +203,136 @@ func (r *relayController) openSession(parent context.Context, id, camera string)
 	r.sessions[id] = session
 	r.mu.Unlock()
 	go r.readLocalSignals(session)
+}
+
+// signalingSource limits WebRTC access to configured camera streams and their
+// conventional dedicated "_talk" backchannel stream. This lets the Android
+// client select the same stream locally and remotely without turning Edge into
+// an unrestricted proxy for every go2rtc producer.
+func (m *streamManager) signalingSource(requested string) (string, bool) {
+	if !validSignalingSource(requested) {
+		return "", false
+	}
+	if stream := m.get(requested); stream != nil {
+		return stream.sourceName(), true
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	base := strings.TrimSuffix(requested, "_talk")
+	for camera, stream := range m.streams {
+		if requested == camera || (strings.HasSuffix(requested, "_talk") && base == camera) {
+			return requested, true
+		}
+		for _, source := range stream.sourceNames {
+			if requested == source || (strings.HasSuffix(requested, "_talk") && base == source) {
+				return requested, true
+			}
+		}
+	}
+	return "", false
+}
+
+func validSignalingSource(value string) bool {
+	if value == "" || len(value) > 128 || strings.ContainsAny(value, "/\\?#") {
+		return false
+	}
+	for _, char := range value {
+		if char < 0x21 || char > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+func privateRemoteAddress(address string) bool {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsPrivate() {
+		return true
+	}
+	// Tailscale and other CGNAT overlays use 100.64.0.0/10.
+	return ip.To4() != nil && ip.To4()[0] == 100 && ip.To4()[1]&0xc0 == 0x40
+}
+
+func (r *relayController) authorizeLocalClient(request *http.Request) bool {
+	const prefix = "Bearer "
+	authorization := request.Header.Get("Authorization")
+	if !strings.HasPrefix(authorization, prefix) || !privateRemoteAddress(request.RemoteAddr) {
+		return false
+	}
+	provided := strings.TrimSpace(strings.TrimPrefix(authorization, prefix))
+	return len(provided) == len(r.identity.ClientToken) &&
+		subtle.ConstantTimeCompare([]byte(provided), []byte(r.identity.ClientToken)) == 1
+}
+
+// serveLocalWebRTC is the LAN half of the unified Edge talk transport. It
+// forwards only bounded, valid SDP/ICE JSON to loopback go2rtc; media remains
+// encrypted WebRTC and never passes through this HTTP handler.
+func (r *relayController) serveLocalWebRTC(w http.ResponseWriter, request *http.Request) {
+	if !r.authorizeLocalClient(request) {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	source, ok := r.manager.signalingSource(request.URL.Query().Get("src"))
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "stream unavailable"})
+		return
+	}
+	query := url.Values{"src": []string{source}}
+	endpoint := strings.NewReplacer("http://", "ws://", "https://", "wss://").Replace(r.go2rtcURL) +
+		"/api/ws?" + query.Encode()
+	local, response, err := websocket.DefaultDialer.DialContext(request.Context(), endpoint, nil)
+	if err != nil {
+		if response != nil {
+			log.Printf("local Edge signaling returned %s", response.Status)
+		}
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "stream unavailable"})
+		return
+	}
+	defer local.Close()
+	client, err := localWebRTCUpgrader.Upgrade(w, request, http.Header{"X-Fricam-Edge": []string{"1"}})
+	if err != nil {
+		return
+	}
+	defer client.Close()
+	client.SetReadLimit(edgeMaxSignalBytes)
+	local.SetReadLimit(edgeMaxSignalBytes)
+	errors := make(chan error, 2)
+	go proxyWebRTCSignals(local, client, true, errors)
+	go proxyWebRTCSignals(client, local, false, errors)
+	<-errors
+}
+
+func proxyWebRTCSignals(destination, source *websocket.Conn, sanitize bool, result chan<- error) {
+	for {
+		messageType, payload, err := source.ReadMessage()
+		if err != nil {
+			result <- err
+			return
+		}
+		if messageType != websocket.TextMessage || !json.Valid(payload) {
+			result <- errors.New("invalid signaling message")
+			return
+		}
+		if sanitize {
+			var ok bool
+			payload, ok = sanitizeSignalForGo2RTC(payload)
+			if !ok {
+				result <- errors.New("rejected signaling message")
+				return
+			}
+		}
+		if err := destination.WriteMessage(websocket.TextMessage, payload); err != nil {
+			result <- err
+			return
+		}
+	}
 }
 
 func (r *relayController) readLocalSignals(session *relayMediaSession) {

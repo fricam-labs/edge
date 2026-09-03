@@ -176,6 +176,13 @@ func main() {
 		}
 		stream.serve(w, r)
 	})
+	mux.HandleFunc("GET /webrtc", func(w http.ResponseWriter, request *http.Request) {
+		if relay == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "relay disabled"})
+			return
+		}
+		relay.serveLocalWebRTC(w, request)
+	})
 	mux.HandleFunc("POST /pair", func(w http.ResponseWriter, r *http.Request) {
 		if relay == nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "relay disabled"})
