@@ -20,6 +20,9 @@ import (
 	"time"
 )
 
+// version is injected at build time from the container tag; "dev" for local builds.
+var version = "dev"
+
 const (
 	packetSize       = 188
 	historyMaxEvents = 8192
@@ -150,7 +153,7 @@ func main() {
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		total, ready, connected := manager.counts()
 		result := map[string]any{
-			"status": "ok", "cameras": total, "ready": ready, "connected": connected,
+			"status": "ok", "version": version, "cameras": total, "ready": ready, "connected": connected,
 		}
 		if relay != nil {
 			result["relay_connected"] = relay.connected.Load()
