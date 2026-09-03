@@ -51,6 +51,30 @@ func TestCachedBootstrapIsNeverBorrowedFromAnotherQuality(t *testing.T) {
 	}
 }
 
+func TestStartupBootstrapSendsOnlyIDRAccessUnit(t *testing.T) {
+	idr := []byte{0, 0, 1, 0x65, 1}
+	pFrame := []byte{0, 0, 1, 0x41, 2}
+	got := startupBootstrap([][]byte{idr, pFrame, pFrame})
+	if len(got) != 1 || !equalBytes(got[0], idr) {
+		t.Fatalf("startup bootstrap = %#v, want only IDR access unit", got)
+	}
+	if got := startupBootstrap([][]byte{pFrame}); got != nil {
+		t.Fatalf("non-IDR bootstrap = %#v, want nil", got)
+	}
+}
+
+func equalBytes(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for index := range a {
+		if a[index] != b[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestH264RTPStartsIDR(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -680,12 +680,21 @@ func (s *streamCache) h264Bootstrap() [][]byte {
 	if s.codec != "h264" || len(s.cache) == 0 {
 		return nil
 	}
-	return extractVideoAccessUnits(s.cache)
+	return startupBootstrap(extractVideoAccessUnits(s.cache))
+}
+
+// startupBootstrap deliberately sends only the decoder-safe IDR access unit.
+// A cached GOP can exceed a megabyte on common cameras; bursting a complete GOP
+// for every tile fills the TURN/WebRTC queue and delays the first visible frame
+// by seconds. The bridge joins live media again at the next IDR boundary.
+func startupBootstrap(accessUnits [][]byte) [][]byte {
+	if len(accessUnits) == 0 || !containsIDR(accessUnits[0], "h264") {
+		return nil
+	}
+	return accessUnits[:1]
 }
 
 // extractVideoAccessUnits returns every Annex-B video PES in the cached GOP.
-// Sending the complete GOP preserves the reference frames between its IDR and
-// the live RTP packets that follow it.
 func extractVideoAccessUnits(ts []byte) [][]byte {
 	parser := &tsParser{}
 	var result [][]byte
