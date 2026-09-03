@@ -72,6 +72,7 @@ type viewBridge struct {
 	startedAt         time.Time
 	remoteReady       chan struct{}
 	bootstrapWritten  atomic.Bool
+	waitForVideoIDR   atomic.Bool
 	paused            atomic.Bool
 	videoContinuity   videoRTPContinuity
 }
@@ -169,8 +170,26 @@ func (b *viewBridge) mark(phase string) {
 
 func mediaAPI() (*webrtc.API, error) {
 	engine := &webrtc.MediaEngine{}
-	if err := engine.RegisterDefaultCodecs(); err != nil {
-		return nil, err
+	codecs := []struct {
+		parameters webrtc.RTPCodecParameters
+		kind       webrtc.RTPCodecType
+	}{
+		{webrtc.RTPCodecParameters{RTPCodecCapability: webrtc.RTPCodecCapability{
+			MimeType: webrtc.MimeTypeH264, ClockRate: 90000,
+			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+		}, PayloadType: 96}, webrtc.RTPCodecTypeVideo},
+		{webrtc.RTPCodecParameters{RTPCodecCapability: webrtc.RTPCodecCapability{
+			MimeType: webrtc.MimeTypePCMA, ClockRate: 8000, Channels: 1,
+		}, PayloadType: 8}, webrtc.RTPCodecTypeAudio},
+		{webrtc.RTPCodecParameters{RTPCodecCapability: webrtc.RTPCodecCapability{
+			MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2,
+			SDPFmtpLine: "minptime=10;useinbandfec=1",
+		}, PayloadType: 111}, webrtc.RTPCodecTypeAudio},
+	}
+	for _, codec := range codecs {
+		if err := engine.RegisterCodec(codec.parameters, codec.kind); err != nil {
+			return nil, err
+		}
 	}
 	return newWebRTCAPI(engine)
 }
@@ -220,7 +239,10 @@ func (b *viewBridge) start() error {
 	if err != nil {
 		return fmt.Errorf("remote WebRTC: %w", err)
 	}
-	firstVideo, err := b.connectLocal(ctx, video, audio)
+	b.mu.Lock()
+	source := b.source
+	b.mu.Unlock()
+	firstVideo, err := b.connectLocal(ctx, video, audio, source)
 	if err != nil {
 		return fmt.Errorf("local stream: %w", err)
 	}
@@ -244,7 +266,6 @@ func (b *viewBridge) start() error {
 	}
 	select {
 	case <-firstVideo:
-		b.mark("first_video_rtp")
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -270,16 +291,7 @@ func edgeViewPeerConfiguration(servers []edgeICEServer) webrtc.Configuration {
 }
 
 func edgeTalkPeerConfiguration(servers []edgeICEServer) webrtc.Configuration {
-	configuration := edgeViewPeerConfiguration(servers)
-	for _, server := range servers {
-		for _, candidateURL := range server.URLs {
-			if strings.HasPrefix(candidateURL, "turn:") || strings.HasPrefix(candidateURL, "turns:") {
-				configuration.ICETransportPolicy = webrtc.ICETransportPolicyRelay
-				return configuration
-			}
-		}
-	}
-	return configuration
+	return edgeViewPeerConfiguration(servers)
 }
 
 func (b *viewBridge) connectRemote(
@@ -371,6 +383,7 @@ func (b *viewBridge) connectLocal(
 	ctx context.Context,
 	video *webrtc.TrackLocalStaticRTP,
 	audio *webrtc.TrackLocalStaticRTP,
+	source string,
 ) (<-chan struct{}, error) {
 	api, err := mediaAPI()
 	if err != nil {
@@ -429,6 +442,12 @@ func (b *viewBridge) connectLocal(
 					continue
 				}
 			}
+			if track.Kind() == webrtc.RTPCodecTypeVideo && b.waitForVideoIDR.Load() {
+				if !h264RTPStartsIDR(packet.Payload) {
+					continue
+				}
+				b.waitForVideoIDR.Store(false)
+			}
 			b.mediaWriteMu.Lock()
 			if track.Kind() == webrtc.RTPCodecTypeVideo {
 				b.videoContinuity.rewriteLive(packet)
@@ -442,15 +461,12 @@ func (b *viewBridge) connectLocal(
 			b.bytesForwarded.Add(uint64(len(packet.Payload)))
 			if track.Kind() == webrtc.RTPCodecTypeVideo {
 				firstVideoOnce.Do(func() {
-					b.mark("live_video_rtp")
+					b.mark("first_video_rtp")
 					close(firstVideo)
 				})
 			}
 		}
 	})
-	b.mu.Lock()
-	source := b.source
-	b.mu.Unlock()
 	query := url.Values{"src": []string{source}}
 	endpoint := strings.NewReplacer("http://", "ws://", "https://", "wss://").Replace(b.go2rtcURL) +
 		"/api/ws?" + query.Encode()
@@ -524,6 +540,33 @@ func (b *viewBridge) connectLocal(
 	}
 }
 
+// h264RTPStartsIDR recognizes the packet that starts an IDR access unit for
+// single-NALU, STAP-A and FU-A payloads. A later FU-A fragment is not decodable.
+func h264RTPStartsIDR(payload []byte) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	switch payload[0] & 0x1f {
+	case 5:
+		return true
+	case 24: // STAP-A
+		for offset := 1; offset+2 <= len(payload); {
+			size := int(payload[offset])<<8 | int(payload[offset+1])
+			offset += 2
+			if size == 0 || offset+size > len(payload) {
+				return false
+			}
+			if payload[offset]&0x1f == 5 {
+				return true
+			}
+			offset += size
+		}
+	case 28: // FU-A
+		return len(payload) >= 2 && payload[1]&0x80 != 0 && payload[1]&0x1f == 5
+	}
+	return false
+}
+
 func (b *viewBridge) writeBootstrap(destination *webrtc.TrackLocalStaticRTP) bool {
 	b.mu.Lock()
 	provider := b.bootstrap
@@ -551,6 +594,9 @@ func (b *viewBridge) writeBootstrap(destination *webrtc.TrackLocalStaticRTP) boo
 	}
 	b.videoContinuity.finishBootstrap(sequence, timestamp)
 	b.bootstrapWritten.Store(true)
+	// A cached GOP renders immediately, but dependent frames from another GOP
+	// cannot safely follow it. Join every following live epoch at a fresh IDR.
+	b.waitForVideoIDR.Store(true)
 	return true
 }
 
@@ -587,26 +633,50 @@ func (b *viewBridge) setPaused(paused bool) {
 }
 
 func (b *viewBridge) switchSource(source string, bootstrap func() [][]byte) error {
+	// Never interrupt the active source for an upgrade that cannot start with a
+	// complete H.264 GOP. The cached IDR is the decoder-safe handoff boundary.
+	initialBootstrap := bootstrap()
+	if len(initialBootstrap) == 0 {
+		return errors.New("quality source has no cached keyframe")
+	}
 	b.paused.Store(true)
 	b.mu.Lock()
 	oldLocal, oldSocket := b.local, b.localSocket
-	b.local, b.localSocket = nil, nil
-	b.source, b.bootstrap = source, bootstrap
+	oldSource, oldBootstrap := b.source, b.bootstrap
 	video, audio := b.video, b.audio
+	b.mu.Unlock()
+	if video == nil || audio == nil {
+		b.paused.Store(false)
+		return errors.New("remote tracks unavailable")
+	}
+	ctx, cancel := context.WithTimeout(b.ctx, 5*time.Second)
+	defer cancel()
+	if _, err := b.connectLocal(ctx, video, audio, source); err != nil {
+		b.mu.Lock()
+		b.local, b.localSocket = oldLocal, oldSocket
+		b.source, b.bootstrap = oldSource, oldBootstrap
+		b.mu.Unlock()
+		b.paused.Store(false)
+		return err
+	}
+	// New local signaling is ready. Only now retire the sub source and publish
+	// the new source metadata. The first provider call uses the exact GOP that
+	// was validated before preparation; later resumes sample the fresh cache.
+	var first atomic.Bool
+	b.mu.Lock()
+	b.source = source
+	b.bootstrap = func() [][]byte {
+		if first.CompareAndSwap(false, true) {
+			return initialBootstrap
+		}
+		return bootstrap()
+	}
 	b.mu.Unlock()
 	if oldSocket != nil {
 		_ = oldSocket.Close()
 	}
 	if oldLocal != nil {
 		_ = oldLocal.Close()
-	}
-	if video == nil || audio == nil {
-		return errors.New("remote tracks unavailable")
-	}
-	ctx, cancel := context.WithTimeout(b.ctx, 5*time.Second)
-	defer cancel()
-	if _, err := b.connectLocal(ctx, video, audio); err != nil {
-		return err
 	}
 	// Stay paused until Android has detached the old camera renderer and
 	// acknowledges readiness with edge/resume. That resume writes the cached

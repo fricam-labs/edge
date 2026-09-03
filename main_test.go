@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pion/webrtc/v4"
 )
 
 func boolPtr(value bool) *bool { return &value }
@@ -35,6 +36,38 @@ func TestContainsIDR(t *testing.T) {
 				t.Fatalf("containsIDR() = %v, want %v", got, test.want)
 			}
 		})
+	}
+}
+
+func TestH264RTPStartsIDR(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload []byte
+		want    bool
+	}{
+		{"single IDR", []byte{0x65, 0x01}, true},
+		{"single P-frame", []byte{0x41, 0x01}, false},
+		{"FU-A IDR start", []byte{0x7c, 0x85, 0x01}, true},
+		{"FU-A IDR continuation", []byte{0x7c, 0x05, 0x01}, false},
+		{"STAP-A containing IDR", []byte{0x78, 0, 2, 0x67, 0x01, 0, 2, 0x65, 0x01}, true},
+		{"malformed STAP-A", []byte{0x78, 0, 8, 0x65}, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := h264RTPStartsIDR(test.payload); got != test.want {
+				t.Fatalf("h264RTPStartsIDR() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestEdgePeerConfigurationsKeepEdgeOnAllICE(t *testing.T) {
+	servers := []edgeICEServer{{URLs: []string{"turns:turn.cloudflare.com:443?transport=tcp"}}}
+	if got := edgeViewPeerConfiguration(servers).ICETransportPolicy; got != webrtc.ICETransportPolicyAll {
+		t.Fatalf("view ICE policy = %v, want ALL", got)
+	}
+	if got := edgeTalkPeerConfiguration(servers).ICETransportPolicy; got != webrtc.ICETransportPolicyAll {
+		t.Fatalf("talk ICE policy = %v, want ALL", got)
 	}
 }
 

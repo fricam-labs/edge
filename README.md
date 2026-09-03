@@ -36,9 +36,13 @@ LAN/Tailscale interfaces so the Android app can auto-discover it:
 - `GET /stream/<camera-name>.ts`
 - `GET /webrtc?src=<stream-name>` (paired WebSocket signaling)
 
-The sidecar supports H.264 and H.265 streams advertised in the MPEG-TS PMT. It uses
-Docker host networking to reach the loopback-only go2rtc API in the existing
-Frigate container. Do not port-forward 8099 to the public internet.
+The LAN MPEG-TS endpoint supports H.264 and H.265 streams advertised in the PMT.
+Remote WebRTC is intentionally H.264-only so an incompatible camera fails during
+negotiation instead of producing a long black-screen timeout. For an H.265 camera,
+configure a go2rtc H.264 restream (for example `ffmpeg:<source>#video=h264`) and use
+that stream as the camera's preferred Frigate live stream. The sidecar uses Docker
+host networking to reach the loopback-only go2rtc API in the existing Frigate
+container. Do not port-forward 8099 to the public internet.
 
 For remote access it opens one outbound `wss://relay.fricam.app` control
 connection. The Worker forwards only bounded SDP/ICE JSON. Camera media travels
