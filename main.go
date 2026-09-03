@@ -253,7 +253,10 @@ func cameraFromPath(path string) (string, bool) {
 func loadConfig() config {
 	maxMiB := mustIntEnv("MAX_CACHE_MIB", 16, 1, 128)
 	discoverySeconds := mustIntEnv("DISCOVERY_INTERVAL_SEC", 30, 5, 3600)
-	idleSeconds := mustIntEnv("SOURCE_IDLE_TIMEOUT_SEC", 15, 5, 120)
+	// Some RTSP cameras pause delivery while producing an IDR or while go2rtc
+	// adds a second consumer. Fifteen seconds caused healthy warm caches to be
+	// torn down during rapid camera switching; keep the watchdog conservative.
+	idleSeconds := mustIntEnv("SOURCE_IDLE_TIMEOUT_SEC", 60, 15, 300)
 	return config{
 		listen:            env("LISTEN_ADDR", "127.0.0.1:8099"),
 		frigateURL:        strings.TrimRight(env("FRIGATE_URL", "http://127.0.0.1:5000"), "/"),
