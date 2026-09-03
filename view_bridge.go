@@ -160,6 +160,11 @@ func (b *viewBridge) start() error {
 	select {
 	case <-remoteConnected:
 		b.mark("remote_connected")
+		if b.paused.Load() {
+			close(b.remoteReady)
+			b.mark("warm_paused")
+			return nil
+		}
 		if b.writeBootstrap(video) {
 			b.mark("cached_gop_sent")
 			close(b.remoteReady)
@@ -510,6 +515,7 @@ func (b *viewBridge) setPaused(paused bool) {
 		_ = b.writeBootstrap(video)
 	}
 	b.paused.Store(false)
+	b.mark("warm_resumed")
 }
 
 func (b *viewBridge) switchSource(source string, bootstrap func() [][]byte) error {
@@ -534,10 +540,10 @@ func (b *viewBridge) switchSource(source string, bootstrap func() [][]byte) erro
 	if _, err := b.connectLocal(ctx, video, audio); err != nil {
 		return err
 	}
-	if !b.writeBootstrap(video) {
-		return errors.New("bootstrap unavailable")
-	}
-	b.paused.Store(false)
+	// Stay paused until Android has detached the old camera renderer and
+	// acknowledges readiness with edge/resume. That resume writes the cached
+	// GOP, so no frame from the previous source can flash on screen.
+	b.mark("warm_source_ready")
 	return nil
 }
 
