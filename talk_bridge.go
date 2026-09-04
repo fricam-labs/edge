@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -32,6 +33,7 @@ type talkBridge struct {
 	source    string
 	offer     talkBridgeOffer
 	send      func(json.RawMessage)
+	writeRTP  func(*webrtc.TrackLocalStaticRTP, *rtp.Packet) error
 
 	mu                sync.Mutex
 	remote            *webrtc.PeerConnection
@@ -86,14 +88,14 @@ func newTalkBridge(
 	ctx, cancel := context.WithCancel(parent)
 	return &talkBridge{
 		ctx: ctx, cancel: cancel, go2rtcURL: go2rtcURL,
-		source: source, offer: offer, send: send,
+		source: source, offer: offer, send: send, writeRTP: writeLocalRTP,
 	}
 }
 
 func (b *talkBridge) start() error {
 	ctx, cancel := context.WithTimeout(b.ctx, talkBridgeTimeout)
 	defer cancel()
-	localTrack, err := webrtc.NewTrackLocalStaticRTP(
+	localTrack, err := newRTPTrack(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypePCMA, ClockRate: 8000, Channels: 1},
 		"microphone", "fricam-edge",
 	)
@@ -111,7 +113,7 @@ func (b *talkBridge) start() error {
 
 func pcmaAPI() (*webrtc.API, error) {
 	mediaEngine := &webrtc.MediaEngine{}
-	if err := mediaEngine.RegisterCodec(webrtc.RTPCodecParameters{
+	if err := registerWebRTCCodec(mediaEngine, webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
 			MimeType: webrtc.MimeTypePCMA, ClockRate: 8000, Channels: 1,
 		},
@@ -123,11 +125,11 @@ func pcmaAPI() (*webrtc.API, error) {
 }
 
 func (b *talkBridge) connectLocal(ctx context.Context, track *webrtc.TrackLocalStaticRTP) error {
-	api, err := pcmaAPI()
+	api, err := pcmaAPIFactory()
 	if err != nil {
 		return err
 	}
-	peer, err := api.NewPeerConnection(webrtc.Configuration{})
+	peer, err := newPeerConnection(api, webrtc.Configuration{})
 	if err != nil {
 		return err
 	}
@@ -135,7 +137,7 @@ func (b *talkBridge) connectLocal(ctx context.Context, track *webrtc.TrackLocalS
 	b.local = peer
 	b.mu.Unlock()
 
-	transceiver, err := peer.AddTransceiverFromTrack(track, webrtc.RTPTransceiverInit{
+	transceiver, err := peerAddTransceiverFromTrack(peer, track, webrtc.RTPTransceiverInit{
 		Direction: webrtc.RTPTransceiverDirectionSendonly,
 	})
 	if err != nil {
@@ -175,41 +177,28 @@ func (b *talkBridge) connectLocal(ctx context.Context, track *webrtc.TrackLocalS
 	b.localSocket = socket
 	b.mu.Unlock()
 
-	offer, err := peer.CreateOffer(nil)
+	offer, err := peerCreateOffer(peer, nil)
 	if err != nil {
 		return err
 	}
-	gathering := webrtc.GatheringCompletePromise(peer)
-	if err := peer.SetLocalDescription(offer); err != nil {
+	gathering := gatheringCompletePromise(peer)
+	if err := peerSetLocalDescription(peer, offer); err != nil {
 		return err
 	}
-	select {
-	case <-gathering:
-	case <-ctx.Done():
-		return ctx.Err()
+	if err := waitContext(gathering, ctx); err != nil {
+		return err
 	}
-	if err := socket.WriteJSON(map[string]string{
+	if err := writeWebSocketJSON(socket, map[string]string{
 		"type": "webrtc/offer", "value": peer.LocalDescription().SDP,
 	}); err != nil {
 		return err
 	}
 	answerSet := make(chan struct{}, 1)
 	go b.readLocalSignals(peer, socket, answerSet, failed)
-	select {
-	case <-answerSet:
-	case err := <-failed:
+	if err := waitPeer(answerSet, failed, ctx); err != nil {
 		return err
-	case <-ctx.Done():
-		return ctx.Err()
 	}
-	select {
-	case <-connected:
-		return nil
-	case err := <-failed:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return waitPeer(connected, failed, ctx)
 }
 
 func (b *talkBridge) readLocalSignals(
@@ -260,20 +249,14 @@ func (b *talkBridge) readLocalSignals(
 }
 
 func (b *talkBridge) connectRemote(ctx context.Context, localTrack *webrtc.TrackLocalStaticRTP) error {
-	api, err := pcmaAPI()
+	api, err := pcmaAPIFactory()
 	if err != nil {
 		return err
 	}
-	servers := make([]webrtc.ICEServer, 0, len(b.offer.ICEServers))
-	for _, server := range b.offer.ICEServers {
-		servers = append(servers, webrtc.ICEServer{
-			URLs: server.URLs, Username: server.Username,
-			Credential: server.Credential, CredentialType: webrtc.ICECredentialTypePassword,
-		})
-	}
+	servers := edgeICEServers(b.offer.ICEServers)
 	configuration := edgeTalkPeerConfiguration(b.offer.ICEServers)
 	configuration.ICEServers = servers
-	peer, err := api.NewPeerConnection(configuration)
+	peer, err := newPeerConnection(api, configuration)
 	if err != nil {
 		return err
 	}
@@ -294,11 +277,9 @@ func (b *talkBridge) connectRemote(ctx context.Context, localTrack *webrtc.Track
 			if err != nil {
 				return
 			}
-			if err := localTrack.WriteRTP(packet); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+			if !b.forwardRemotePacket(localTrack, packet) {
 				return
 			}
-			b.packetsForwarded.Add(1)
-			b.bytesForwarded.Add(uint64(len(packet.Payload)))
 		}
 	})
 	failed := make(chan error, 1)
@@ -310,60 +291,44 @@ func (b *talkBridge) connectRemote(ctx context.Context, localTrack *webrtc.Track
 			}
 		}
 	})
-	if err := peer.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: b.offer.SDP}); err != nil {
+	if err := peerSetRemoteDescription(peer, webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: b.offer.SDP}); err != nil {
 		return err
 	}
 	for _, candidate := range pending {
 		_ = peer.AddICECandidate(candidate)
 	}
-	answer, err := peer.CreateAnswer(nil)
+	answer, err := peerCreateAnswer(peer, nil)
 	if err != nil {
 		return err
 	}
 	answerSent := atomic.Bool{}
 	var candidateMu sync.Mutex
 	pendingLocal := make([]string, 0, 8)
-	peer.OnICECandidate(func(candidate *webrtc.ICECandidate) {
-		if candidate == nil {
-			return
-		}
-		value := candidate.ToJSON().Candidate
-		candidateMu.Lock()
-		if !answerSent.Load() {
-			pendingLocal = append(pendingLocal, value)
-			candidateMu.Unlock()
-			return
-		}
-		candidateMu.Unlock()
-		b.sendSignal("webrtc/candidate", value)
-	})
-	if err := peer.SetLocalDescription(answer); err != nil {
+	registerICECandidate(peer, candidateHandler(&answerSent, &candidateMu, &pendingLocal, b.sendCandidate))
+	if err := peerSetLocalDescription(peer, answer); err != nil {
 		return err
 	}
-	payload, err := json.Marshal(map[string]interface{}{
+	payload, _ := json.Marshal(map[string]interface{}{
 		"type":  "webrtc",
 		"value": map[string]string{"type": "answer", "sdp": peer.LocalDescription().SDP},
 	})
-	if err != nil {
-		return err
-	}
 	b.send(payload)
 	candidateMu.Lock()
 	answerSent.Store(true)
 	queued := append([]string(nil), pendingLocal...)
 	pendingLocal = nil
 	candidateMu.Unlock()
-	for _, candidate := range queued {
-		b.sendSignal("webrtc/candidate", candidate)
+	_ = flushCandidates(queued, b.sendCandidate)
+	return waitPeer(trackStarted, failed, ctx)
+}
+
+func (b *talkBridge) forwardRemotePacket(localTrack *webrtc.TrackLocalStaticRTP, packet *rtp.Packet) bool {
+	if err := b.writeRTP(localTrack, packet); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+		return false
 	}
-	select {
-	case <-trackStarted:
-		return nil
-	case err := <-failed:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	b.packetsForwarded.Add(1)
+	b.bytesForwarded.Add(uint64(len(packet.Payload)))
+	return true
 }
 
 func (b *talkBridge) sendSignal(kind, value string) {
@@ -371,6 +336,11 @@ func (b *talkBridge) sendSignal(kind, value string) {
 	if err == nil {
 		b.send(payload)
 	}
+}
+
+func (b *talkBridge) sendCandidate(value string) error {
+	b.sendSignal("webrtc/candidate", value)
+	return nil
 }
 
 func (b *talkBridge) addClientSignal(payload []byte) {

@@ -29,6 +29,8 @@ const (
 	historyKeep      = 4096
 )
 
+var firstKeyframeTimeout = 3 * time.Second
+
 type config struct {
 	listen            string
 	frigateURL        string
@@ -125,28 +127,43 @@ func (c *deadlineConn) Read(p []byte) (int, error) {
 	return c.Conn.Read(p)
 }
 
+var listenAndServe = (*http.Server).ListenAndServe
+var fatalLog = log.Fatal
+var fatalLogf = log.Fatalf
+var startRefreshLoop = launchRefreshLoop
+var startRelayLoop = launchRelayLoop
+var daemonContext = context.Background
+
+func launchRefreshLoop(manager *streamManager) { go manager.refreshLoop(daemonContext()) }
+func launchRelayLoop(relay *relayController)   { go relay.run(daemonContext()) }
+
 func main() {
+	if err := runEdge(); err != nil {
+		fatalLog(err)
+	}
+}
+
+func runEdge() error {
 	cfg := loadConfig()
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
-		runHealthcheck(cfg.listen)
-		return
+		return runHealthcheck(cfg.listen)
 	}
 
 	manager := newStreamManager(cfg)
 	if err := manager.sync(context.Background()); err != nil {
-		log.Fatalf("initial Frigate camera discovery failed: %v", err)
+		return fmt.Errorf("initial Frigate camera discovery failed: %w", err)
 	}
-	go manager.refreshLoop(context.Background())
+	startRefreshLoop(manager)
 	var relay *relayController
 	var pairing *pairingManager
 	if cfg.relayURL != "" {
 		identity, err := loadOrCreateIdentity(cfg.identityFile)
 		if err != nil {
-			log.Fatalf("edge identity: %v", err)
+			return fmt.Errorf("edge identity: %w", err)
 		}
 		relay = newRelayController(cfg.relayURL, cfg.go2rtcURL, identity, manager)
 		pairing = newPairingManager(identity)
-		go relay.run(context.Background())
+		startRelayLoop(relay)
 	}
 
 	mux := http.NewServeMux()
@@ -239,7 +256,7 @@ func main() {
 		IdleTimeout:       30 * time.Second,
 	}
 	log.Printf("fricam-edge listening on %s; auto-discovery=%s quality=%s", cfg.listen, cfg.discoveryInterval, cfg.preferredQuality)
-	log.Fatal(server.ListenAndServe())
+	return listenAndServe(server)
 }
 
 func cameraFromPath(path string) (string, bool) {
@@ -282,10 +299,7 @@ func validateFrigateAuthorization(ctx context.Context, authURL, authorization st
 	if err != nil || !isPrivateAuthHost(parsedAuthURL.Hostname()) {
 		return false
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, authURL+"/api/config", nil)
-	if err != nil {
-		return false
-	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, authURL+"/api/config", nil)
 	req.Header.Set("Authorization", authorization)
 	if strings.HasPrefix(authorization, "Bearer ") {
 		req.Header.Set("Cookie", "frigate_token="+strings.TrimPrefix(authorization, "Bearer "))
@@ -327,15 +341,15 @@ func env(key, fallback string) string {
 func mustIntEnv(key string, fallback, min, max int) int {
 	value, err := strconv.Atoi(env(key, strconv.Itoa(fallback)))
 	if err != nil || value < min || value > max {
-		log.Fatalf("%s must be between %d and %d", key, min, max)
+		fatalLogf("%s must be between %d and %d", key, min, max)
 	}
 	return value
 }
 
-func runHealthcheck(listen string) {
+func runHealthcheck(listen string) error {
 	host, port, err := net.SplitHostPort(listen)
 	if err != nil {
-		os.Exit(1)
+		return err
 	}
 	if host == "" || host == "0.0.0.0" || host == "::" {
 		host = "127.0.0.1"
@@ -343,12 +357,13 @@ func runHealthcheck(listen string) {
 	client := http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Get("http://" + net.JoinHostPort(host, port) + "/health")
 	if err != nil {
-		os.Exit(1)
+		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		os.Exit(1)
+		return fmt.Errorf("healthcheck returned %s", resp.Status)
 	}
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
@@ -774,7 +789,7 @@ func (s *streamCache) serve(w http.ResponseWriter, r *http.Request) {
 	var snapshot []byte
 	var cursor uint64
 	var wakeup chan struct{}
-	deadline := time.NewTimer(3 * time.Second)
+	deadline := time.NewTimer(firstKeyframeTimeout)
 	defer deadline.Stop()
 	for len(snapshot) == 0 {
 		s.mu.RLock()

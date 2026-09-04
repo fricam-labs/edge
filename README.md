@@ -1,5 +1,7 @@
 # Fricam Edge
 
+![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)
+
 Open-source acceleration service for the Fricam Android client and self-hosted
 Frigate servers.
 

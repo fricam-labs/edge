@@ -20,6 +20,9 @@ var appIconSVG []byte
 
 const pairingCodeTTL = 5 * time.Minute
 
+var pairingRandomRead = rand.Read
+var pairingQREncode = qrcode.Encode
+
 type pairingPayload struct {
 	Version  int    `json:"v"`
 	Type     string `json:"type"`
@@ -41,7 +44,7 @@ func newPairingManager(identity edgeIdentity) *pairingManager {
 
 func (p *pairingManager) issue(origin string) (pairingPayload, error) {
 	random := make([]byte, 24)
-	if _, err := rand.Read(random); err != nil {
+	if _, err := pairingRandomRead(random); err != nil {
 		return pairingPayload{}, err
 	}
 	code := base64.RawURLEncoding.EncodeToString(random)
@@ -98,7 +101,7 @@ func (p *pairingManager) servePage(w http.ResponseWriter, request *http.Request)
 		return
 	}
 	raw, _ := json.Marshal(payload)
-	png, err := qrcode.Encode(string(raw), qrcode.Medium, 384)
+	png, err := pairingQREncode(string(raw), qrcode.Medium, 384)
 	if err != nil {
 		http.Error(w, "could not render pairing code", http.StatusInternalServerError)
 		return

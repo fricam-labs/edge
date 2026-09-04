@@ -26,10 +26,17 @@ import (
 
 const clientTokenContext = "fricam-edge-client-v1"
 
-const (
-	relayPingInterval = 30 * time.Second
-	relayPongTimeout  = 65 * time.Second
-)
+var identityRandomRead = rand.Read
+var identityReadFile = os.ReadFile
+var identityMkdirAll = os.MkdirAll
+var identityWriteFile = os.WriteFile
+
+const relayPongTimeout = 65 * time.Second
+
+var relayPingInterval = 30 * time.Second
+
+var relayConnectAttempt = func(relay *relayController, ctx context.Context) error { return relay.connect(ctx) }
+var relayRetryDelay = time.Second
 
 type edgeIdentity struct {
 	DeviceID    string `json:"device_id"`
@@ -49,7 +56,7 @@ func deriveIdentity(root string) edgeIdentity {
 }
 
 func loadOrCreateIdentity(path string) (edgeIdentity, error) {
-	if raw, err := os.ReadFile(path); err == nil {
+	if raw, err := identityReadFile(path); err == nil {
 		var stored edgeIdentity
 		if json.Unmarshal(raw, &stored) == nil && stored.RootSecret != "" {
 			return deriveIdentity(stored.RootSecret), nil
@@ -58,32 +65,31 @@ func loadOrCreateIdentity(path string) (edgeIdentity, error) {
 		return edgeIdentity{}, err
 	}
 	secret := make([]byte, 32)
-	if _, err := rand.Read(secret); err != nil {
+	if _, err := identityRandomRead(secret); err != nil {
 		return edgeIdentity{}, err
 	}
 	identity := deriveIdentity(base64.RawURLEncoding.EncodeToString(secret))
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+	if err := identityMkdirAll(filepath.Dir(path), 0700); err != nil {
 		return edgeIdentity{}, err
 	}
-	raw, err := json.Marshal(struct {
+	raw, _ := json.Marshal(struct {
 		DeviceID   string `json:"device_id"`
 		RootSecret string `json:"root_secret"`
 	}{identity.DeviceID, identity.RootSecret})
-	if err != nil {
-		return edgeIdentity{}, err
-	}
-	if err := os.WriteFile(path, raw, 0600); err != nil {
+	if err := identityWriteFile(path, raw, 0600); err != nil {
 		return edgeIdentity{}, err
 	}
 	return identity, nil
 }
 
 type relayController struct {
-	relayURL  string
-	go2rtcURL string
-	identity  edgeIdentity
-	manager   *streamManager
-	connected atomic.Bool
+	relayURL     string
+	go2rtcURL    string
+	identity     edgeIdentity
+	manager      *streamManager
+	connected    atomic.Bool
+	pingInterval time.Duration
+	writeControl func(*websocket.Conn, int, []byte, time.Time) error
 
 	mu       sync.Mutex
 	conn     *websocket.Conn
@@ -112,6 +118,12 @@ type relayMediaSession struct {
 
 const edgeMaxSignalBytes = 128 * 1024
 
+var startTalkBridge = runTalkBridge
+var startViewBridge = runViewBridge
+
+func runTalkBridge(bridge *talkBridge) error { return bridge.start() }
+func runViewBridge(bridge *viewBridge) error { return bridge.start() }
+
 var localWebRTCUpgrader = websocket.Upgrader{
 	CheckOrigin: func(*http.Request) bool { return true },
 }
@@ -120,6 +132,7 @@ func newRelayController(relayURL, go2rtcURL string, identity edgeIdentity, manag
 	return &relayController{
 		relayURL: strings.TrimRight(relayURL, "/"), go2rtcURL: strings.TrimRight(go2rtcURL, "/"),
 		identity: identity, manager: manager, sessions: make(map[string]*relayMediaSession),
+		pingInterval: relayPingInterval, writeControl: (*websocket.Conn).WriteControl,
 	}
 }
 
@@ -128,13 +141,13 @@ func (r *relayController) httpRelayURL() string {
 }
 
 func (r *relayController) run(ctx context.Context) {
-	delay := time.Second
+	delay := relayRetryDelay
 	for ctx.Err() == nil {
-		if err := r.connect(ctx); err != nil && ctx.Err() == nil {
+		if err := relayConnectAttempt(r, ctx); err != nil && ctx.Err() == nil {
 			log.Printf("edge relay disconnected: %v", err)
 		}
 		if r.connected.Swap(false) {
-			delay = time.Second
+			delay = relayRetryDelay
 		}
 		r.closeSessions()
 		select {
@@ -174,7 +187,7 @@ func (r *relayController) connect(ctx context.Context) error {
 	pingDone := make(chan struct{})
 	defer close(pingDone)
 	go func() {
-		ticker := time.NewTicker(relayPingInterval)
+		ticker := time.NewTicker(r.pingInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -184,7 +197,7 @@ func (r *relayController) connect(ctx context.Context) error {
 				return
 			case <-ticker.C:
 				r.writeMu.Lock()
-				err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
+				err := r.writeControl(conn, websocket.PingMessage, nil, time.Now().Add(5*time.Second))
 				r.writeMu.Unlock()
 				if err != nil {
 					_ = conn.Close()
@@ -443,7 +456,7 @@ func (r *relayController) writeLocalSignal(id string, payload json.RawMessage) {
 			session.talk = bridge
 			session.writeMu.Unlock()
 			go func() {
-				if err := bridge.start(); err != nil {
+				if err := startTalkBridge(bridge); err != nil {
 					log.Printf("edge talk bridge camera=%s failed: %v", session.camera, err)
 					r.send(relayEnvelope{SessionID: id, Payload: json.RawMessage(`{"type":"error","value":"talk unavailable"}`)})
 					r.closeSession(id)
@@ -462,7 +475,7 @@ func (r *relayController) writeLocalSignal(id string, payload json.RawMessage) {
 			session.view = bridge
 			session.writeMu.Unlock()
 			go func() {
-				if err := bridge.start(); err != nil {
+				if err := startViewBridge(bridge); err != nil {
 					log.Printf("edge view bridge camera=%s failed: %v", session.camera, err)
 					r.send(relayEnvelope{SessionID: id, Payload: json.RawMessage(`{"type":"error","value":"stream unavailable"}`)})
 					r.closeSession(id)
@@ -477,7 +490,7 @@ func (r *relayController) writeLocalSignal(id string, payload json.RawMessage) {
 			r.send(relayEnvelope{SessionID: id, Payload: json.RawMessage(`{"type":"error","value":"stream unavailable"}`)})
 			return
 		}
-		_ = session.conn.WriteMessage(websocket.TextMessage, payload)
+		_ = writeWebSocketMessage(session.conn, websocket.TextMessage, payload)
 		session.writeMu.Unlock()
 	}
 }

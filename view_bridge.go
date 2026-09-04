@@ -25,6 +25,78 @@ const viewBridgeTimeout = 15 * time.Second
 
 type viewBridgeOffer = talkBridgeOffer
 
+var newRTPTrack = webrtc.NewTrackLocalStaticRTP
+var mediaAPIFactory = mediaAPI
+var pcmaAPIFactory = pcmaAPI
+var newPeerConnection = func(api *webrtc.API, configuration webrtc.Configuration) (*webrtc.PeerConnection, error) {
+	return api.NewPeerConnection(configuration)
+}
+var registerWebRTCCodec = func(engine *webrtc.MediaEngine, parameters webrtc.RTPCodecParameters, kind webrtc.RTPCodecType) error {
+	return engine.RegisterCodec(parameters, kind)
+}
+var registerWebRTCInterceptors = webrtc.RegisterDefaultInterceptors
+var peerAddTrack = (*webrtc.PeerConnection).AddTrack
+var peerAddTransceiverFromKind = (*webrtc.PeerConnection).AddTransceiverFromKind
+var peerAddTransceiverFromTrack = (*webrtc.PeerConnection).AddTransceiverFromTrack
+var peerCreateOffer = (*webrtc.PeerConnection).CreateOffer
+var peerCreateAnswer = (*webrtc.PeerConnection).CreateAnswer
+var peerSetLocalDescription = (*webrtc.PeerConnection).SetLocalDescription
+var peerSetRemoteDescription = (*webrtc.PeerConnection).SetRemoteDescription
+var readSenderRTCP = (*webrtc.RTPSender).ReadRTCP
+var writeLocalRTP = (*webrtc.TrackLocalStaticRTP).WriteRTP
+var writeWebSocketJSON = (*websocket.Conn).WriteJSON
+var writeWebSocketMessage = (*websocket.Conn).WriteMessage
+var gatheringCompletePromise = webrtc.GatheringCompletePromise
+var connectViewRemote = (*viewBridge).connectRemote
+var connectViewLocal = (*viewBridge).connectLocal
+var registerICECandidate = (*webrtc.PeerConnection).OnICECandidate
+
+func candidateHandler(sent *atomic.Bool, mu *sync.Mutex, pending *[]string, send func(string) error) func(*webrtc.ICECandidate) {
+	return func(candidate *webrtc.ICECandidate) {
+		if candidate == nil {
+			return
+		}
+		value := candidate.ToJSON().Candidate
+		mu.Lock()
+		if !sent.Load() {
+			*pending = append(*pending, value)
+			mu.Unlock()
+			return
+		}
+		mu.Unlock()
+		_ = send(value)
+	}
+}
+
+func flushCandidates(pending []string, send func(string) error) error {
+	for _, candidate := range pending {
+		if err := send(candidate); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func waitContext(ready <-chan struct{}, ctx context.Context) error {
+	select {
+	case <-ready:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func waitPeer(ready <-chan struct{}, failed <-chan error, ctx context.Context) error {
+	select {
+	case <-ready:
+		return nil
+	case err := <-failed:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func parseViewBridgeOffer(payload []byte) (viewBridgeOffer, bool) {
 	var signal struct {
 		Type  string          `json:"type"`
@@ -56,6 +128,7 @@ type viewBridge struct {
 	offer     viewBridgeOffer
 	bootstrap func() [][]byte
 	send      func(json.RawMessage)
+	writeRTP  func(*webrtc.TrackLocalStaticRTP, *rtp.Packet) error
 
 	mu                sync.Mutex
 	mediaWriteMu      sync.Mutex
@@ -152,7 +225,7 @@ func newViewBridge(
 	ctx, cancel := context.WithCancel(parent)
 	bridge := &viewBridge{
 		ctx: ctx, cancel: cancel, go2rtcURL: go2rtcURL,
-		source: source, bootstrap: bootstrap, offer: offer, send: send, startedAt: time.Now(),
+		source: source, bootstrap: bootstrap, offer: offer, send: send, writeRTP: writeLocalRTP, startedAt: time.Now(),
 		remoteReady: make(chan struct{}),
 	}
 	// Starting paused is part of the offer so it is applied before either peer
@@ -187,7 +260,7 @@ func mediaAPI() (*webrtc.API, error) {
 		}, PayloadType: 111}, webrtc.RTPCodecTypeAudio},
 	}
 	for _, codec := range codecs {
-		if err := engine.RegisterCodec(codec.parameters, codec.kind); err != nil {
+		if err := registerWebRTCCodec(engine, codec.parameters, codec.kind); err != nil {
 			return nil, err
 		}
 	}
@@ -196,7 +269,7 @@ func mediaAPI() (*webrtc.API, error) {
 
 func newWebRTCAPI(engine *webrtc.MediaEngine) (*webrtc.API, error) {
 	registry := &interceptor.Registry{}
-	if err := webrtc.RegisterDefaultInterceptors(engine, registry); err != nil {
+	if err := registerWebRTCInterceptors(engine, registry); err != nil {
 		return nil, err
 	}
 	setting := webrtc.SettingEngine{}
@@ -215,7 +288,7 @@ func newWebRTCAPI(engine *webrtc.MediaEngine) (*webrtc.API, error) {
 func (b *viewBridge) start() error {
 	ctx, cancel := context.WithTimeout(b.ctx, viewBridgeTimeout)
 	defer cancel()
-	video, err := webrtc.NewTrackLocalStaticRTP(
+	video, err := newRTPTrack(
 		webrtc.RTPCodecCapability{
 			MimeType: webrtc.MimeTypeH264, ClockRate: 90000,
 			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
@@ -225,7 +298,7 @@ func (b *viewBridge) start() error {
 	if err != nil {
 		return err
 	}
-	audio, err := webrtc.NewTrackLocalStaticRTP(
+	audio, err := newRTPTrack(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypePCMA, ClockRate: 8000, Channels: 1},
 		"audio", "fricam-edge",
 	)
@@ -235,41 +308,34 @@ func (b *viewBridge) start() error {
 	b.mu.Lock()
 	b.video, b.audio = video, audio
 	b.mu.Unlock()
-	remoteConnected, err := b.connectRemote(ctx, video, audio)
+	remoteConnected, err := connectViewRemote(b, ctx, video, audio)
 	if err != nil {
 		return fmt.Errorf("remote WebRTC: %w", err)
 	}
 	b.mu.Lock()
 	source := b.source
 	b.mu.Unlock()
-	firstVideo, err := b.connectLocal(ctx, video, audio, source)
+	firstVideo, err := connectViewLocal(b, ctx, video, audio, source)
 	if err != nil {
 		return fmt.Errorf("local stream: %w", err)
 	}
-	select {
-	case <-remoteConnected:
-		b.mark("remote_connected")
-		if b.paused.Load() {
-			close(b.remoteReady)
-			b.mark("warm_paused")
-			return nil
-		}
-		if b.writeBootstrap(video) {
-			b.mark("cached_gop_sent")
-			close(b.remoteReady)
-			b.mark("bootstrap_video_rtp")
-			return nil
-		}
+	if err := waitContext(remoteConnected, ctx); err != nil {
+		return err
+	}
+	b.mark("remote_connected")
+	if b.paused.Load() {
 		close(b.remoteReady)
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	select {
-	case <-firstVideo:
+		b.mark("warm_paused")
 		return nil
-	case <-ctx.Done():
-		return ctx.Err()
 	}
+	if b.writeBootstrap(video) {
+		b.mark("cached_gop_sent")
+		close(b.remoteReady)
+		b.mark("bootstrap_video_rtp")
+		return nil
+	}
+	close(b.remoteReady)
+	return waitContext(firstVideo, ctx)
 }
 
 func edgeICEServers(servers []edgeICEServer) []webrtc.ICEServer {
@@ -299,11 +365,11 @@ func (b *viewBridge) connectRemote(
 	video *webrtc.TrackLocalStaticRTP,
 	audio *webrtc.TrackLocalStaticRTP,
 ) (<-chan struct{}, error) {
-	api, err := mediaAPI()
+	api, err := mediaAPIFactory()
 	if err != nil {
 		return nil, err
 	}
-	peer, err := api.NewPeerConnection(edgeViewPeerConfiguration(b.offer.ICEServers))
+	peer, err := newPeerConnection(api, edgeViewPeerConfiguration(b.offer.ICEServers))
 	if err != nil {
 		return nil, err
 	}
@@ -313,11 +379,11 @@ func (b *viewBridge) connectRemote(
 	b.pendingCandidates = nil
 	b.mu.Unlock()
 
-	videoSender, err := peer.AddTrack(video)
+	videoSender, err := peerAddTrack(peer, video)
 	if err != nil {
 		return nil, err
 	}
-	audioSender, err := peer.AddTrack(audio)
+	audioSender, err := peerAddTrack(peer, audio)
 	if err != nil {
 		return nil, err
 	}
@@ -333,39 +399,26 @@ func (b *viewBridge) connectRemote(
 	answerSent := atomic.Bool{}
 	var candidateMu sync.Mutex
 	pendingLocal := make([]string, 0, 8)
-	peer.OnICECandidate(func(candidate *webrtc.ICECandidate) {
-		if candidate == nil {
-			return
-		}
-		value := candidate.ToJSON().Candidate
-		candidateMu.Lock()
-		if !answerSent.Load() {
-			pendingLocal = append(pendingLocal, value)
-			candidateMu.Unlock()
-			return
-		}
-		candidateMu.Unlock()
+	registerICECandidate(peer, candidateHandler(&answerSent, &candidateMu, &pendingLocal, func(value string) error {
 		b.sendSignal("webrtc/candidate", value)
-	})
-	if err := peer.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: b.offer.SDP}); err != nil {
+		return nil
+	}))
+	if err := peerSetRemoteDescription(peer, webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: b.offer.SDP}); err != nil {
 		return nil, err
 	}
 	for _, candidate := range pending {
 		_ = peer.AddICECandidate(candidate)
 	}
-	answer, err := peer.CreateAnswer(nil)
+	answer, err := peerCreateAnswer(peer, nil)
 	if err != nil {
 		return nil, err
 	}
-	if err := peer.SetLocalDescription(answer); err != nil {
+	if err := peerSetLocalDescription(peer, answer); err != nil {
 		return nil, err
 	}
-	payload, err := json.Marshal(map[string]interface{}{
+	payload, _ := json.Marshal(map[string]interface{}{
 		"type": "webrtc", "value": map[string]string{"type": "answer", "sdp": peer.LocalDescription().SDP},
 	})
-	if err != nil {
-		return nil, err
-	}
 	b.send(payload)
 	b.mark("answer_sent")
 	candidateMu.Lock()
@@ -373,9 +426,7 @@ func (b *viewBridge) connectRemote(
 	queued := append([]string(nil), pendingLocal...)
 	pendingLocal = nil
 	candidateMu.Unlock()
-	for _, candidate := range queued {
-		b.sendSignal("webrtc/candidate", candidate)
-	}
+	_ = flushCandidates(queued, b.sendCandidate)
 	return connected, nil
 }
 
@@ -385,23 +436,23 @@ func (b *viewBridge) connectLocal(
 	audio *webrtc.TrackLocalStaticRTP,
 	source string,
 ) (<-chan struct{}, error) {
-	api, err := mediaAPI()
+	api, err := mediaAPIFactory()
 	if err != nil {
 		return nil, err
 	}
-	peer, err := api.NewPeerConnection(webrtc.Configuration{})
+	peer, err := newPeerConnection(api, webrtc.Configuration{})
 	if err != nil {
 		return nil, err
 	}
 	b.mu.Lock()
 	b.local = peer
 	b.mu.Unlock()
-	if _, err = peer.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
+	if _, err = peerAddTransceiverFromKind(peer, webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
 		Direction: webrtc.RTPTransceiverDirectionRecvonly,
 	}); err != nil {
 		return nil, err
 	}
-	if _, err = peer.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
+	if _, err = peerAddTransceiverFromKind(peer, webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{
 		Direction: webrtc.RTPTransceiverDirectionRecvonly,
 	}); err != nil {
 		return nil, err
@@ -425,45 +476,8 @@ func (b *viewBridge) connectLocal(
 			if readErr != nil {
 				return
 			}
-			// During a warm source switch, wait until edge/resume has written the
-			// new source's cached GOP. Establishing the sequence/timestamp mapping
-			// while paused would anchor live packets to the previous camera and
-			// make Android reject the stream until it falls back to HD.
-			if b.paused.Load() {
-				continue
-			}
-			if track.Kind() == webrtc.RTPCodecTypeVideo && !bootstrapReady {
-				select {
-				case <-b.remoteReady:
-					bootstrapReady = true
-				default:
-					// The cache is sampled only after remote ICE connects, so these
-					// pre-ready packets are already represented in the fresh GOP.
-					continue
-				}
-			}
-			if track.Kind() == webrtc.RTPCodecTypeVideo && b.waitForVideoIDR.Load() {
-				if !h264RTPStartsIDR(packet.Payload) {
-					continue
-				}
-				b.waitForVideoIDR.Store(false)
-			}
-			b.mediaWriteMu.Lock()
-			if track.Kind() == webrtc.RTPCodecTypeVideo {
-				b.videoContinuity.rewriteLive(packet)
-			}
-			writeErr := destination.WriteRTP(packet)
-			b.mediaWriteMu.Unlock()
-			if writeErr != nil && !errors.Is(writeErr, io.ErrClosedPipe) {
+			if !b.forwardLocalPacket(track.Kind(), destination, packet, &bootstrapReady, &firstVideoOnce, firstVideo) {
 				return
-			}
-			b.packetsForwarded.Add(1)
-			b.bytesForwarded.Add(uint64(len(packet.Payload)))
-			if track.Kind() == webrtc.RTPCodecTypeVideo {
-				firstVideoOnce.Do(func() {
-					b.mark("first_video_rtp")
-					close(firstVideo)
-				})
 			}
 		}
 	})
@@ -485,30 +499,20 @@ func (b *viewBridge) connectLocal(
 	writeSignal := func(signal map[string]string) error {
 		socketWriteMu.Lock()
 		defer socketWriteMu.Unlock()
-		return socket.WriteJSON(signal)
+		return writeWebSocketJSON(socket, signal)
 	}
 	offerSent := atomic.Bool{}
 	var candidateMu sync.Mutex
 	pendingLocal := make([]string, 0, 8)
-	peer.OnICECandidate(func(candidate *webrtc.ICECandidate) {
-		if candidate == nil {
-			return
-		}
-		value := candidate.ToJSON().Candidate
-		candidateMu.Lock()
-		if !offerSent.Load() {
-			pendingLocal = append(pendingLocal, value)
-			candidateMu.Unlock()
-			return
-		}
-		candidateMu.Unlock()
-		_ = writeSignal(map[string]string{"type": "webrtc/candidate", "value": value})
-	})
-	offer, err := peer.CreateOffer(nil)
+	sendCandidate := func(value string) error {
+		return writeSignal(map[string]string{"type": "webrtc/candidate", "value": value})
+	}
+	registerICECandidate(peer, candidateHandler(&offerSent, &candidateMu, &pendingLocal, sendCandidate))
+	offer, err := peerCreateOffer(peer, nil)
 	if err != nil {
 		return nil, err
 	}
-	if err := peer.SetLocalDescription(offer); err != nil {
+	if err := peerSetLocalDescription(peer, offer); err != nil {
 		return nil, err
 	}
 	if err := writeSignal(map[string]string{
@@ -521,23 +525,57 @@ func (b *viewBridge) connectLocal(
 	queued := append([]string(nil), pendingLocal...)
 	pendingLocal = nil
 	candidateMu.Unlock()
-	for _, candidate := range queued {
-		if err := writeSignal(map[string]string{"type": "webrtc/candidate", "value": candidate}); err != nil {
-			return nil, err
-		}
+	if err := flushCandidates(queued, sendCandidate); err != nil {
+		return nil, err
 	}
 	answerSet := make(chan struct{}, 1)
 	failed := make(chan error, 1)
 	go b.readLocalSignals(peer, socket, answerSet, failed)
-	select {
-	case <-answerSet:
-		b.mark("local_answer_set")
-		return firstVideo, nil
-	case err := <-failed:
+	if err := waitPeer(answerSet, failed, ctx); err != nil {
 		return nil, err
-	case <-ctx.Done():
-		return nil, ctx.Err()
 	}
+	b.mark("local_answer_set")
+	return firstVideo, nil
+}
+
+func (b *viewBridge) forwardLocalPacket(kind webrtc.RTPCodecType, destination *webrtc.TrackLocalStaticRTP, packet *rtp.Packet, bootstrapReady *bool, firstVideoOnce *sync.Once, firstVideo chan struct{}) bool {
+	// During a warm source switch, wait until edge/resume has written the new
+	// source's cached GOP before establishing sequence/timestamp continuity.
+	if b.paused.Load() {
+		return true
+	}
+	if kind == webrtc.RTPCodecTypeVideo && !*bootstrapReady {
+		select {
+		case <-b.remoteReady:
+			*bootstrapReady = true
+		default:
+			return true
+		}
+	}
+	if kind == webrtc.RTPCodecTypeVideo && b.waitForVideoIDR.Load() {
+		if !h264RTPStartsIDR(packet.Payload) {
+			return true
+		}
+		b.waitForVideoIDR.Store(false)
+	}
+	b.mediaWriteMu.Lock()
+	if kind == webrtc.RTPCodecTypeVideo {
+		b.videoContinuity.rewriteLive(packet)
+	}
+	writeErr := b.writeRTP(destination, packet)
+	b.mediaWriteMu.Unlock()
+	if writeErr != nil && !errors.Is(writeErr, io.ErrClosedPipe) {
+		return false
+	}
+	b.packetsForwarded.Add(1)
+	b.bytesForwarded.Add(uint64(len(packet.Payload)))
+	if kind == webrtc.RTPCodecTypeVideo {
+		firstVideoOnce.Do(func() {
+			b.mark("first_video_rtp")
+			close(firstVideo)
+		})
+	}
+	return true
 }
 
 // h264RTPStartsIDR recognizes the packet that starts an IDR access unit for
@@ -585,7 +623,7 @@ func (b *viewBridge) writeBootstrap(destination *webrtc.TrackLocalStaticRTP) boo
 	for _, accessUnit := range bootstrap {
 		packets := packetizeBootstrapAccessUnit(payloader, accessUnit, sequence, timestamp)
 		for _, packet := range packets {
-			if err := destination.WriteRTP(packet); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+			if err := writeLocalRTP(destination, packet); err != nil && !errors.Is(err, io.ErrClosedPipe) {
 				return false
 			}
 			sequence++
@@ -637,7 +675,7 @@ func (b *viewBridge) setPaused(paused bool) {
 // which can vary by several seconds even after ICE is already connected.
 func (b *viewBridge) forwardVideoRTCP(sender *webrtc.RTPSender) {
 	for {
-		packets, _, err := sender.ReadRTCP()
+		packets, _, err := readSenderRTCP(sender)
 		if err != nil {
 			return
 		}
@@ -707,6 +745,11 @@ func (b *viewBridge) sendSignal(kind, value string) {
 	if err == nil {
 		b.send(payload)
 	}
+}
+
+func (b *viewBridge) sendCandidate(value string) error {
+	b.sendSignal("webrtc/candidate", value)
+	return nil
 }
 
 func (b *viewBridge) addClientSignal(payload []byte) {
