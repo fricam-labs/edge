@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -110,12 +111,30 @@ func TestEdgePeerConfigurationsKeepEdgeOnAllICE(t *testing.T) {
 }
 
 func TestRemoteProxyPathAllowlist(t *testing.T) {
-	for _, path := range []string{"/api/config", "/api/events?after=1", "/api/front/latest.jpg"} {
+	for _, path := range []string{
+		"/api/config",
+		"/api/events?after=1",
+		"/api/front/latest.jpg",
+		"/vod/event/1788614841.123-master.m3u8/master.m3u8",
+		"/vod/front/start/1788610000/end/1788610300/master.m3u8",
+		"/vod/front/start/1788610000/end/1788610300/index-v1-a1.m3u8",
+	} {
 		if !validProxyPath(path) {
 			t.Fatalf("expected allowed proxy path: %s", path)
 		}
 	}
-	for _, path := range []string{"/", "/api/login", "/api/config/save", "/api/../metrics", "/vod/file.mp4"} {
+	for _, path := range []string{
+		"/",
+		"/api/login",
+		"/api/config/save",
+		"/api/../metrics",
+		"/vod/../metrics",
+		"/vod/%2e%2e/metrics",
+		"/vod//front/master.m3u8",
+		"//example.com/vod/front/master.m3u8",
+		"https://example.com/vod/front/master.m3u8",
+		"/vod/front/master.m3u8\\ignored",
+	} {
 		if validProxyPath(path) {
 			t.Fatalf("expected rejected proxy path: %s", path)
 		}
@@ -195,6 +214,92 @@ func TestRemoteProxyStreamsFrigateResponse(t *testing.T) {
 	}
 	if !seenResponse || string(body) != `[{"id":1}]` {
 		t.Fatalf("unexpected proxy result response=%v body=%q", seenResponse, body)
+	}
+}
+
+func TestMultiplexedProxyReusesMetadataCache(t *testing.T) {
+	var requests atomic.Int32
+	frigate := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"streams":["front"]}`))
+	}))
+	defer frigate.Close()
+	client, server, closePair := websocketPair(t)
+	defer closePair()
+	identity := deriveIdentity("proxy-v2-test-root")
+	r := newRelayController("", "", identity, &streamManager{
+		cfg: config{frigateURL: frigate.URL}, client: frigate.Client(),
+	})
+	r.conn = server
+	channelID := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+	readResponse := func(requestID string) string {
+		t.Helper()
+		var body []byte
+		for {
+			kind, raw, err := client.ReadMessage()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if kind == websocket.BinaryMessage {
+				if string(raw[:36]) != channelID {
+					t.Fatalf("wrong channel: %q", raw[:36])
+				}
+				plain, decryptErr := decryptProxyFrame(identity.ClientToken, raw[36:])
+				if decryptErr != nil {
+					t.Fatal(decryptErr)
+				}
+				if string(plain[:36]) != requestID {
+					t.Fatalf("wrong request: %q", plain[:36])
+				}
+				body = append(body, plain[36:]...)
+				continue
+			}
+			var envelope relayEnvelope
+			if json.Unmarshal(raw, &envelope) != nil {
+				t.Fatal("invalid envelope")
+			}
+			plain, decryptErr := decryptProxyPayload(identity.ClientToken, envelope.Payload)
+			if decryptErr != nil {
+				t.Fatal(decryptErr)
+			}
+			var control struct{ Type, ID string }
+			if json.Unmarshal(plain, &control) != nil {
+				t.Fatal("invalid control")
+			}
+			if control.ID != requestID {
+				t.Fatalf("wrong control request: %q", control.ID)
+			}
+			if control.Type == "end" {
+				return string(body)
+			}
+		}
+	}
+
+	for _, requestID := range []string{
+		"11111111-1111-1111-1111-111111111111",
+		"22222222-2222-2222-2222-222222222222",
+	} {
+		go r.runProxyRequest(context.Background(), channelID, requestID, http.MethodGet, "/api/go2rtc/streams/front", nil, nil, true)
+		if body := readResponse(requestID); body != `{"streams":["front"]}` {
+			t.Fatalf("body=%q", body)
+		}
+	}
+	if requests.Load() != 1 {
+		t.Fatalf("cache made %d Frigate requests", requests.Load())
+	}
+}
+
+func TestProxyCachePolicy(t *testing.T) {
+	if proxyCacheTTL(http.MethodGet, "/api/config", nil) == 0 ||
+		proxyCacheTTL(http.MethodGet, "/api/go2rtc/streams/front", nil) == 0 {
+		t.Fatal("metadata paths were not cached")
+	}
+	if proxyCacheTTL(http.MethodPost, "/api/config", nil) != 0 ||
+		proxyCacheTTL(http.MethodGet, "/api/config", map[string]string{"Range": "bytes=0-1"}) != 0 ||
+		proxyCacheTTL(http.MethodGet, "/api/events", nil) != 0 {
+		t.Fatal("unsafe response was cacheable")
 	}
 }
 

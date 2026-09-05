@@ -660,13 +660,17 @@ func (b *viewBridge) setPaused(paused bool) {
 		b.paused.Store(true)
 		return
 	}
+	// Duplicate resume controls must not inject another bootstrap GOP or force
+	// the live stream to wait for yet another IDR frame.
+	if !b.paused.CompareAndSwap(true, false) {
+		return
+	}
 	b.mu.Lock()
 	video := b.video
 	b.mu.Unlock()
 	if video != nil {
 		_ = b.writeBootstrap(video)
 	}
-	b.paused.Store(false)
 	b.mark("warm_resumed")
 }
 
