@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -105,6 +107,103 @@ func TestEdgePeerConfigurationsKeepEdgeOnAllICE(t *testing.T) {
 	if got := edgeTalkPeerConfiguration(servers).ICETransportPolicy; got != webrtc.ICETransportPolicyAll {
 		t.Fatalf("talk ICE policy = %v, want ALL", got)
 	}
+}
+
+func TestRemoteProxyPathAllowlist(t *testing.T) {
+	for _, path := range []string{"/api/config", "/api/events?after=1", "/api/front/latest.jpg"} {
+		if !validProxyPath(path) {
+			t.Fatalf("expected allowed proxy path: %s", path)
+		}
+	}
+	for _, path := range []string{"/", "/api/login", "/api/config/save", "/api/../metrics", "/vod/file.mp4"} {
+		if validProxyPath(path) {
+			t.Fatalf("expected rejected proxy path: %s", path)
+		}
+	}
+}
+
+func TestRemoteProxyEncryptionRoundTrip(t *testing.T) {
+	sealed, err := encryptProxyBytes("client-token", []byte("camera bytes"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(base64.RawStdEncoding.EncodeToString(sealed))
+	plain, err := decryptProxyPayload("client-token", raw)
+	if err != nil || string(plain) != "camera bytes" {
+		t.Fatalf("proxy encryption round trip failed: %q %v", plain, err)
+	}
+	if _, err := decryptProxyPayload("different-token", raw); err == nil {
+		t.Fatal("proxy payload decrypted with a different paired-device token")
+	}
+}
+
+func TestRemoteProxyStreamsFrigateResponse(t *testing.T) {
+	frigate := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/events" || request.Header.Get("Range") != "bytes=0-3" {
+			t.Fatalf("unexpected proxied request: %s range=%s", request.URL.Path, request.Header.Get("Range"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte(`[{"id":1}]`))
+	}))
+	defer frigate.Close()
+	client, server, closePair := websocketPair(t)
+	defer closePair()
+	identity := deriveIdentity("proxy-test-root")
+	r := newRelayController("", "", identity, &streamManager{
+		cfg: config{frigateURL: frigate.URL}, client: frigate.Client(),
+	})
+	r.conn = server
+	id := "12345678-1234-1234-1234-123456789012"
+	go r.runProxy(context.Background(), id, http.MethodGet, "/api/events", map[string]string{"Range": "bytes=0-3"}, nil)
+	var body []byte
+	seenResponse, seenEnd := false, false
+	for !seenEnd {
+		kind, raw, err := client.ReadMessage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if kind == websocket.BinaryMessage {
+			plain, err := decryptProxyFrame(identity.ClientToken, raw[36:])
+			if err != nil {
+				t.Fatal(err)
+			}
+			body = append(body, plain...)
+			continue
+		}
+		var envelope relayEnvelope
+		if json.Unmarshal(raw, &envelope) != nil {
+			t.Fatal("invalid envelope")
+		}
+		plain, err := decryptProxyPayload(identity.ClientToken, envelope.Payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var control struct {
+			Type   string `json:"type"`
+			Status int    `json:"status"`
+		}
+		if json.Unmarshal(plain, &control) != nil {
+			t.Fatal("invalid control")
+		}
+		if control.Type == "response" {
+			seenResponse = control.Status == http.StatusPartialContent
+		}
+		if control.Type == "end" {
+			seenEnd = true
+		}
+	}
+	if !seenResponse || string(body) != `[{"id":1}]` {
+		t.Fatalf("unexpected proxy result response=%v body=%q", seenResponse, body)
+	}
+}
+
+func decryptProxyFrame(clientToken string, sealed []byte) ([]byte, error) {
+	aead, err := proxyAEAD(clientToken)
+	if err != nil || len(sealed) < 12 {
+		return nil, errors.New("invalid frame")
+	}
+	return aead.Open(nil, sealed[:12], sealed[12:], nil)
 }
 
 func TestSelectCameraStreams(t *testing.T) {

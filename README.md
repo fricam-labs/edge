@@ -74,6 +74,15 @@ port, or cloud media storage is used. Android pairs while on the LAN through
 `POST /pair`, whose Frigate bearer token is validated only against the private
 loopback Frigate HTTPS endpoint.
 
+The same authenticated outbound connection carries Fricam Remote Access when
+the configured Frigate address is unreachable. Only bounded `/api/*` requests
+from an entitled, paired client are accepted; login, configuration writes,
+path traversal, and request bodies above 256 KiB are rejected. Request metadata
+and streamed response chunks use AES-256-GCM between the Android app and the
+user's Edge container, so Cloudflare routes ciphertext without reading API
+responses, snapshots, or recordings. A working LAN, VPN, or external address
+remains preferred and does not consume the separate Remote Access allowance.
+
 Two-way audio uses the same Edge contract on every network. On the LAN the app
 opens the authenticated `/webrtc` WebSocket directly; away from home it opens
 the same logical session through the managed relay and uses P2P first with TURN

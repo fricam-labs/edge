@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -10,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -25,6 +28,7 @@ import (
 )
 
 const clientTokenContext = "fricam-edge-client-v1"
+const proxyTokenContext = "fricam-edge-proxy-v1:"
 
 var identityRandomRead = rand.Read
 var identityReadFile = os.ReadFile
@@ -95,6 +99,7 @@ type relayController struct {
 	conn     *websocket.Conn
 	writeMu  sync.Mutex
 	sessions map[string]*relayMediaSession
+	proxies  map[string]context.CancelFunc
 }
 
 type relayEnvelope struct {
@@ -132,6 +137,7 @@ func newRelayController(relayURL, go2rtcURL string, identity edgeIdentity, manag
 	return &relayController{
 		relayURL: strings.TrimRight(relayURL, "/"), go2rtcURL: strings.TrimRight(go2rtcURL, "/"),
 		identity: identity, manager: manager, sessions: make(map[string]*relayMediaSession),
+		proxies:      make(map[string]context.CancelFunc),
 		pingInterval: relayPingInterval, writeControl: (*websocket.Conn).WriteControl,
 	}
 }
@@ -207,9 +213,12 @@ func (r *relayController) connect(ctx context.Context) error {
 		}
 	}()
 	for {
-		_, raw, err := conn.ReadMessage()
+		messageType, raw, err := conn.ReadMessage()
 		if err != nil {
 			return err
+		}
+		if messageType != websocket.TextMessage {
+			continue
 		}
 		var message relayEnvelope
 		if json.Unmarshal(raw, &message) != nil {
@@ -222,7 +231,166 @@ func (r *relayController) connect(ctx context.Context) error {
 			r.closeSession(message.SessionID)
 		case "signal":
 			r.writeLocalSignal(message.SessionID, message.Payload)
+		case "proxy/message":
+			r.openProxy(ctx, message.SessionID, message.Payload)
+		case "proxy/close":
+			r.closeProxy(message.SessionID)
 		}
+	}
+}
+
+type proxyRequest struct {
+	Method   string            `json:"method"`
+	Path     string            `json:"path"`
+	Headers  map[string]string `json:"headers"`
+	Body     string            `json:"body,omitempty"`
+	IssuedAt int64             `json:"issuedAt"`
+}
+
+func validProxyPath(path string) bool {
+	if !strings.HasPrefix(path, "/api/") || strings.Contains(path, "..") || len(path) > 2048 {
+		return false
+	}
+	return !strings.HasPrefix(path, "/api/login") && !strings.HasPrefix(path, "/api/config/save")
+}
+
+func (r *relayController) openProxy(parent context.Context, id string, payload json.RawMessage) {
+	var input proxyRequest
+	plain, decryptErr := decryptProxyPayload(r.identity.ClientToken, payload)
+	now := time.Now().Unix()
+	if id == "" || decryptErr != nil || json.Unmarshal(plain, &input) != nil ||
+		!validProxyPath(input.Path) || input.IssuedAt < now-60 || input.IssuedAt > now+60 {
+		r.sendProxyControl(id, map[string]any{"type": "error", "status": 400})
+		return
+	}
+	method := strings.ToUpper(input.Method)
+	if method != http.MethodGet && method != http.MethodHead && method != http.MethodPost && method != http.MethodPut && method != http.MethodDelete {
+		r.sendProxyControl(id, map[string]any{"type": "error", "status": 405})
+		return
+	}
+	body, err := base64.RawStdEncoding.DecodeString(input.Body)
+	if err != nil || len(body) > 256*1024 {
+		r.sendProxyControl(id, map[string]any{"type": "error", "status": 413})
+		return
+	}
+	r.closeProxy(id)
+	ctx, cancel := context.WithCancel(parent)
+	r.mu.Lock()
+	r.proxies[id] = cancel
+	r.mu.Unlock()
+	go r.runProxy(ctx, id, method, input.Path, input.Headers, body)
+}
+
+func (r *relayController) runProxy(ctx context.Context, id, method, path string, headers map[string]string, body []byte) {
+	defer r.closeProxy(id)
+	request, err := http.NewRequestWithContext(ctx, method, r.manager.cfg.frigateURL+path, strings.NewReader(string(body)))
+	if err != nil {
+		return
+	}
+	for _, name := range []string{"Accept", "Content-Type", "Range", "If-None-Match", "If-Modified-Since"} {
+		if value := headers[name]; value != "" {
+			request.Header.Set(name, value)
+		}
+	}
+	response, err := r.manager.client.Do(request)
+	if err != nil {
+		r.sendProxyControl(id, map[string]any{"type": "error", "status": 502})
+		return
+	}
+	defer response.Body.Close()
+	r.sendProxyControl(id, map[string]any{"type": "response", "status": response.StatusCode, "headers": map[string]string{
+		"Content-Type": response.Header.Get("Content-Type"), "Content-Length": response.Header.Get("Content-Length"),
+		"Content-Range": response.Header.Get("Content-Range"), "ETag": response.Header.Get("ETag"),
+	}})
+	buffer := make([]byte, 256*1024)
+	for {
+		n, readErr := response.Body.Read(buffer)
+		if n > 0 && !r.sendProxyBinary(id, buffer[:n]) {
+			return
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return
+		}
+	}
+	r.sendProxyControl(id, map[string]any{"type": "end"})
+}
+
+func proxyAEAD(clientToken string) (cipher.AEAD, error) {
+	key := sha256.Sum256([]byte(proxyTokenContext + clientToken))
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+
+func encryptProxyBytes(clientToken string, plain []byte) ([]byte, error) {
+	aead, err := proxyAEAD(clientToken)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, aead.NonceSize())
+	if _, err = rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	return aead.Seal(nonce, nonce, plain, nil), nil
+}
+
+func decryptProxyPayload(clientToken string, raw json.RawMessage) ([]byte, error) {
+	var encoded string
+	if json.Unmarshal(raw, &encoded) != nil {
+		return nil, errors.New("invalid encrypted proxy payload")
+	}
+	sealed, err := base64.RawStdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, err
+	}
+	aead, err := proxyAEAD(clientToken)
+	if err != nil || len(sealed) < aead.NonceSize() {
+		return nil, errors.New("invalid encrypted proxy payload")
+	}
+	return aead.Open(nil, sealed[:aead.NonceSize()], sealed[aead.NonceSize():], nil)
+}
+
+func (r *relayController) sendProxyControl(id string, value any) {
+	plain, _ := json.Marshal(value)
+	sealed, err := encryptProxyBytes(r.identity.ClientToken, plain)
+	if err != nil {
+		return
+	}
+	payload, _ := json.Marshal(base64.RawStdEncoding.EncodeToString(sealed))
+	r.send(relayEnvelope{Type: "proxy/message", SessionID: id, Payload: payload})
+}
+
+func (r *relayController) sendProxyBinary(id string, payload []byte) bool {
+	r.mu.Lock()
+	conn := r.conn
+	r.mu.Unlock()
+	if conn == nil || len(id) != 36 {
+		return false
+	}
+	sealed, err := encryptProxyBytes(r.identity.ClientToken, payload)
+	if err != nil {
+		return false
+	}
+	frame := make([]byte, 36+len(sealed))
+	copy(frame, id)
+	copy(frame[36:], sealed)
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+	return conn.WriteMessage(websocket.BinaryMessage, frame) == nil
+}
+
+func (r *relayController) closeProxy(id string) {
+	r.mu.Lock()
+	cancel := r.proxies[id]
+	delete(r.proxies, id)
+	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -635,9 +803,14 @@ func (r *relayController) closeSession(id string) {
 func (r *relayController) closeSessions() {
 	r.mu.Lock()
 	sessions := r.sessions
+	proxies := r.proxies
 	r.sessions = make(map[string]*relayMediaSession)
+	r.proxies = make(map[string]context.CancelFunc)
 	r.conn = nil
 	r.mu.Unlock()
+	for _, cancel := range proxies {
+		cancel()
+	}
 	for _, session := range sessions {
 		session.cancel()
 		session.writeMu.Lock()
