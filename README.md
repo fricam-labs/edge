@@ -46,7 +46,10 @@ Discovery runs every 30 seconds by default. Newly enabled cameras are added and
 removed or disabled cameras are stopped without restarting the sidecar. `HD` is
 the preferred Frigate live-stream label. If it stalls, the sidecar automatically
 rotates through that camera's other configured live streams and finally the
-camera-named go2rtc stream. The last valid in-memory GOP remains available while
+camera-named go2rtc stream. While on a fallback stream it retries the preferred
+stream every `PREFERRED_RETRY_SEC` (default 120, backing off up to 8x when the
+preferred stream keeps failing), so a go2rtc restart does not leave cameras pinned
+to a transcoded fallback. The last valid in-memory GOP remains available while
 the source reconnects, and is replaced as soon as the fallback produces a new
 keyframe.
 

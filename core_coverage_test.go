@@ -2719,3 +2719,60 @@ func TestViewConnectLocalLateErrors(t *testing.T) {
 	}
 	b.close()
 }
+
+func TestStreamRunReturnsToPreferredAfterFallback(t *testing.T) {
+	var mainHits atomic.Int32
+	ts := testTransportStream()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("src") == "main" {
+			mainHits.Add(1)
+			http.Error(w, "down", http.StatusBadGateway)
+			return
+		}
+		_, _ = w.Write(ts)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cache := &streamCache{name: "front", sourceNames: []string{"main", "sub"}, go2rtcURL: server.URL, client: server.Client(), ctx: ctx, cancel: cancel, wakeup: make(chan struct{}), preferredRetry: 30 * time.Millisecond, maxCache: len(ts) * 2}
+	cache.start()
+	defer cache.stop()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		cache.mu.RLock()
+		wait, index := cache.retryWait, cache.sourceIndex
+		cache.mu.RUnlock()
+		// Two preferred attempts prove the fallback was bounded and retried;
+		// the quick second failure must grow the backoff beyond the base.
+		if mainHits.Load() >= 2 && wait > cache.preferredRetry && index == 1 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("preferred stream not retried: hits=%d %#v", mainHits.Load(), cache.metrics())
+}
+
+func TestConsumeContextUnboundedForPreferredOrDisabledRetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cache := &streamCache{sourceNames: []string{"main", "sub"}, ctx: ctx, cancel: cancel, preferredRetry: time.Hour}
+	if c, cancelC, retrying := cache.consumeContext(); retrying {
+		t.Fatal("preferred source must not be bounded")
+	} else {
+		cancelC()
+		_ = c
+	}
+	cache.sourceIndex, cache.preferredRetry = 1, 0
+	if _, cancelC, retrying := cache.consumeContext(); retrying {
+		t.Fatal("disabled retry must not be bounded")
+	} else {
+		cancelC()
+	}
+	cache.preferredRetry = time.Hour
+	c, cancelC, retrying := cache.consumeContext()
+	defer cancelC()
+	if _, ok := c.Deadline(); !retrying || !ok || cache.retryWait != time.Hour {
+		t.Fatalf("fallback source must be bounded: %v %v", retrying, cache.retryWait)
+	}
+}

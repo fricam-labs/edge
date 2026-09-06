@@ -39,6 +39,7 @@ type config struct {
 	discoveryInterval time.Duration
 	maxCache          int
 	idleTimeout       time.Duration
+	preferredRetry    time.Duration
 	relayURL          string
 	identityFile      string
 	frigateAuthURL    string
@@ -71,8 +72,11 @@ type streamCache struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 
+	preferredRetry time.Duration
+
 	mu           sync.RWMutex
 	sourceIndex  int
+	retryWait    time.Duration
 	cache        []byte
 	history      []packetEvent
 	sequence     uint64
@@ -277,6 +281,10 @@ func loadConfig() config {
 	// adds a second consumer. Fifteen seconds caused healthy warm caches to be
 	// torn down during rapid camera switching; keep the watchdog conservative.
 	idleSeconds := mustIntEnv("SOURCE_IDLE_TIMEOUT_SEC", 60, 15, 300)
+	// After falling back to a secondary stream (typically a transcoded _sub),
+	// periodically return to the preferred stream so a go2rtc restart does not
+	// pin every camera on its most expensive source forever.
+	retrySeconds := mustIntEnv("PREFERRED_RETRY_SEC", 120, 10, 3600)
 	return config{
 		listen:            env("LISTEN_ADDR", "127.0.0.1:8099"),
 		frigateURL:        strings.TrimRight(env("FRIGATE_URL", "http://127.0.0.1:5000"), "/"),
@@ -285,6 +293,7 @@ func loadConfig() config {
 		discoveryInterval: time.Duration(discoverySeconds) * time.Second,
 		maxCache:          maxMiB * 1024 * 1024,
 		idleTimeout:       time.Duration(idleSeconds) * time.Second,
+		preferredRetry:    time.Duration(retrySeconds) * time.Second,
 		relayURL:          strings.TrimRight(os.Getenv("EDGE_RELAY_URL"), "/"),
 		identityFile:      env("EDGE_IDENTITY_FILE", "/data/identity.json"),
 		frigateAuthURL:    strings.TrimRight(env("FRIGATE_AUTH_URL", "https://127.0.0.1:8971"), "/"),
@@ -554,7 +563,8 @@ func newStreamCache(name string, sources []string, cfg config) *streamCache {
 	return &streamCache{
 		name: name, sourceNames: append([]string(nil), sources...), go2rtcURL: cfg.go2rtcURL,
 		maxCache: cfg.maxCache, idleTimeout: cfg.idleTimeout, client: newHTTPClient(cfg.idleTimeout),
-		ctx: ctx, cancel: cancel, wakeup: make(chan struct{}),
+		preferredRetry: cfg.preferredRetry,
+		ctx:            ctx, cancel: cancel, wakeup: make(chan struct{}),
 	}
 }
 
@@ -574,7 +584,21 @@ func (s *streamCache) sourceName() string {
 
 func (s *streamCache) run() {
 	for {
-		if err := s.consume(); err != nil && !errors.Is(err, context.Canceled) {
+		ctx, cancel, retrying := s.consumeContext()
+		started := time.Now()
+		err := s.consumeWith(ctx)
+		cancel()
+		if retrying && ctx.Err() != nil && s.ctx.Err() == nil {
+			s.mu.Lock()
+			s.connected = false
+			s.sourceIndex = 0
+			s.history = s.history[:0]
+			log.Printf("camera %s retrying preferred stream %s", s.name, s.sourceNames[0])
+			s.signalLocked()
+			s.mu.Unlock()
+			continue
+		}
+		if err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("camera %s stream %s disconnected: %v", s.name, s.sourceName(), err)
 		}
 		select {
@@ -586,6 +610,15 @@ func (s *streamCache) run() {
 		s.connected = false
 		s.reconnects++
 		if len(s.sourceNames) > 1 {
+			if s.sourceIndex == 0 {
+				// Back off preferred retries while the preferred stream keeps
+				// failing quickly; a stable preferred run resets the wait.
+				if time.Since(started) < s.preferredRetry {
+					s.retryWait = min(s.retryWait*2, 8*s.preferredRetry)
+				} else {
+					s.retryWait = s.preferredRetry
+				}
+			}
 			s.sourceIndex = (s.sourceIndex + 1) % len(s.sourceNames)
 			s.history = s.history[:0]
 			log.Printf("camera %s falling back to stream %s", s.name, s.sourceNames[s.sourceIndex])
@@ -600,10 +633,30 @@ func (s *streamCache) run() {
 	}
 }
 
+// consumeContext bounds a fallback source consumption so the preferred stream
+// is retried after retryWait. The preferred stream itself is never bounded.
+func (s *streamCache) consumeContext() (context.Context, context.CancelFunc, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sourceIndex == 0 || s.preferredRetry <= 0 {
+		ctx, cancel := context.WithCancel(s.ctx)
+		return ctx, cancel, false
+	}
+	if s.retryWait < s.preferredRetry {
+		s.retryWait = s.preferredRetry
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, s.retryWait)
+	return ctx, cancel, true
+}
+
 func (s *streamCache) consume() error {
+	return s.consumeWith(s.ctx)
+}
+
+func (s *streamCache) consumeWith(ctx context.Context) error {
 	source := s.sourceName()
 	query := url.Values{"src": []string{source}}
-	req, err := http.NewRequestWithContext(s.ctx, http.MethodGet, s.go2rtcURL+"/api/stream.ts?"+query.Encode(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.go2rtcURL+"/api/stream.ts?"+query.Encode(), nil)
 	if err != nil {
 		return err
 	}
