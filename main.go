@@ -587,8 +587,9 @@ func (s *streamCache) run() {
 		ctx, cancel, retrying := s.consumeContext()
 		started := time.Now()
 		err := s.consumeWith(ctx)
+		expired := errors.Is(ctx.Err(), context.DeadlineExceeded)
 		cancel()
-		if retrying && ctx.Err() != nil && s.ctx.Err() == nil {
+		if retrying && expired && s.ctx.Err() == nil {
 			s.mu.Lock()
 			s.connected = false
 			s.sourceIndex = 0

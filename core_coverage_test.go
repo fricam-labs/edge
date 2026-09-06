@@ -2776,3 +2776,28 @@ func TestConsumeContextUnboundedForPreferredOrDisabledRetry(t *testing.T) {
 		t.Fatalf("fallback source must be bounded: %v %v", retrying, cache.retryWait)
 	}
 }
+
+func TestStreamRunFallbackErrorRotatesInsteadOfRetrying(t *testing.T) {
+	var hits sync.Map
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		src := r.URL.Query().Get("src")
+		n, _ := hits.LoadOrStore(src, new(atomic.Int32))
+		n.(*atomic.Int32).Add(1)
+		http.Error(w, "down", http.StatusBadGateway)
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cache := &streamCache{name: "front", sourceNames: []string{"main", "sub", "raw"}, go2rtcURL: server.URL, client: server.Client(), ctx: ctx, cancel: cancel, wakeup: make(chan struct{}), preferredRetry: time.Hour}
+	cache.start()
+	defer cache.stop()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		// A failing fallback must advance to the third source rather than
+		// jumping straight back to the preferred stream.
+		if n, ok := hits.Load("raw"); ok && n.(*atomic.Int32).Load() > 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("third source never tried: %#v", cache.metrics())
+}
