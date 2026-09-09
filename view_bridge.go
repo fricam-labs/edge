@@ -130,24 +130,34 @@ type viewBridge struct {
 	send      func(json.RawMessage)
 	writeRTP  func(*webrtc.TrackLocalStaticRTP, *rtp.Packet) error
 
-	mu                sync.Mutex
-	mediaWriteMu      sync.Mutex
-	remote            *webrtc.PeerConnection
-	local             *webrtc.PeerConnection
-	localSocket       *websocket.Conn
-	video             *webrtc.TrackLocalStaticRTP
-	audio             *webrtc.TrackLocalStaticRTP
-	pendingCandidates []webrtc.ICECandidateInit
-	closeOnce         sync.Once
-	packetsForwarded  atomic.Uint64
-	bytesForwarded    atomic.Uint64
-	localVideoSSRC    atomic.Uint32
-	startedAt         time.Time
-	remoteReady       chan struct{}
-	bootstrapWritten  atomic.Bool
-	waitForVideoIDR   atomic.Bool
-	paused            atomic.Bool
-	videoContinuity   videoRTPContinuity
+	mu                    sync.Mutex
+	mediaWriteMu          sync.Mutex
+	remote                *webrtc.PeerConnection
+	local                 *webrtc.PeerConnection
+	localSocket           *websocket.Conn
+	video                 *webrtc.TrackLocalStaticRTP
+	audio                 *webrtc.TrackLocalStaticRTP
+	pendingCandidates     []webrtc.ICECandidateInit
+	closeOnce             sync.Once
+	packetsForwarded      atomic.Uint64
+	videoPacketsForwarded atomic.Uint64
+	bytesForwarded        atomic.Uint64
+	localVideoSSRC        atomic.Uint32
+	startedAt             time.Time
+	remoteReady           chan struct{}
+	bootstrapWritten      atomic.Bool
+	waitForVideoIDR       atomic.Bool
+	paused                atomic.Bool
+	videoContinuity       videoRTPContinuity
+	hdContinuity          videoRTPContinuity
+	manager               *streamManager
+	detailSource          string
+	hdVideo               *webrtc.TrackLocalStaticRTP
+	hd                    *viewBridge
+	hdRelease             func()
+	hdGeneration          uint64
+	hdActive              atomic.Bool
+	demandBase            bool
 }
 
 // videoRTPContinuity owns the RTP timeline sent to Android. Local go2rtc
@@ -308,9 +318,28 @@ func (b *viewBridge) start() error {
 	b.mu.Lock()
 	b.video, b.audio = video, audio
 	b.mu.Unlock()
+	if b.offer.Progressive {
+		hd, trackErr := newRTPTrack(video.Codec(), "video-hd", "fricam-edge-hd")
+		if trackErr != nil {
+			return trackErr
+		}
+		b.mu.Lock()
+		b.hdVideo = hd
+		b.mu.Unlock()
+	}
 	remoteConnected, err := connectViewRemote(b, ctx, video, audio)
 	if err != nil {
 		return fmt.Errorf("remote WebRTC: %w", err)
+	}
+	if b.demandBase {
+		close(b.remoteReady)
+		if err := waitContext(remoteConnected, ctx); err != nil {
+			return err
+		}
+		if !b.paused.Load() {
+			b.startHD()
+		}
+		return nil
 	}
 	b.mu.Lock()
 	source := b.source
@@ -389,6 +418,13 @@ func (b *viewBridge) connectRemote(
 	}
 	go b.forwardVideoRTCP(videoSender)
 	go drainRTCP(audioSender)
+	if b.hdVideo != nil {
+		hdSender, addErr := peerAddTrack(peer, b.hdVideo)
+		if addErr != nil {
+			return nil, addErr
+		}
+		go b.forwardHDRTCP(hdSender)
+	}
 	connected := make(chan struct{})
 	var connectedOnce sync.Once
 	peer.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
@@ -445,6 +481,11 @@ func (b *viewBridge) connectLocal(
 		return nil, err
 	}
 	b.mu.Lock()
+	if b.ctx.Err() != nil {
+		b.mu.Unlock()
+		_ = peer.Close()
+		return nil, b.ctx.Err()
+	}
 	b.local = peer
 	b.mu.Unlock()
 	if _, err = peerAddTransceiverFromKind(peer, webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
@@ -493,6 +534,11 @@ func (b *viewBridge) connectLocal(
 	}
 	socket.SetReadLimit(edgeMaxSignalBytes)
 	b.mu.Lock()
+	if b.ctx.Err() != nil {
+		b.mu.Unlock()
+		_ = socket.Close()
+		return nil, b.ctx.Err()
+	}
 	b.localSocket = socket
 	b.mu.Unlock()
 	var socketWriteMu sync.Mutex
@@ -541,7 +587,7 @@ func (b *viewBridge) connectLocal(
 func (b *viewBridge) forwardLocalPacket(kind webrtc.RTPCodecType, destination *webrtc.TrackLocalStaticRTP, packet *rtp.Packet, bootstrapReady *bool, firstVideoOnce *sync.Once, firstVideo chan struct{}) bool {
 	// During a warm source switch, wait until edge/resume has written the new
 	// source's cached GOP before establishing sequence/timestamp continuity.
-	if b.paused.Load() {
+	if b.paused.Load() || (kind == webrtc.RTPCodecTypeVideo && b.hdActive.Load()) {
 		return true
 	}
 	if kind == webrtc.RTPCodecTypeVideo && !*bootstrapReady {
@@ -570,6 +616,7 @@ func (b *viewBridge) forwardLocalPacket(kind webrtc.RTPCodecType, destination *w
 	b.packetsForwarded.Add(1)
 	b.bytesForwarded.Add(uint64(len(packet.Payload)))
 	if kind == webrtc.RTPCodecTypeVideo {
+		b.videoPacketsForwarded.Add(1)
 		firstVideoOnce.Do(func() {
 			b.mark("first_video_rtp")
 			close(firstVideo)
@@ -658,6 +705,7 @@ func packetizeBootstrapAccessUnit(
 func (b *viewBridge) setPaused(paused bool) {
 	if paused {
 		b.paused.Store(true)
+		b.stopHD()
 		return
 	}
 	// Duplicate resume controls must not inject another bootstrap GOP or force
@@ -672,6 +720,9 @@ func (b *viewBridge) setPaused(paused bool) {
 		_ = b.writeBootstrap(video)
 	}
 	b.mark("warm_resumed")
+	if b.demandBase {
+		b.startHD()
+	}
 }
 
 // Forward decoder keyframe requests from Android to the local go2rtc peer.
@@ -761,7 +812,36 @@ func (b *viewBridge) addClientSignal(payload []byte) {
 		Type  string          `json:"type"`
 		Value json.RawMessage `json:"value"`
 	}
-	if json.Unmarshal(payload, &signal) != nil || signal.Type != "webrtc/candidate" {
+	if json.Unmarshal(payload, &signal) != nil {
+		return
+	}
+	if signal.Type == "edge/upgrade" {
+		b.startHD()
+		return
+	}
+	if signal.Type == "edge/downgrade" {
+		if !b.demandBase {
+			b.stopHD()
+		}
+		return
+	}
+	if signal.Type == "edge/quality-ready" {
+		b.mu.Lock()
+		if b.hd != nil && !b.paused.Load() {
+			b.hdActive.Store(true)
+		}
+		b.mu.Unlock()
+		return
+	}
+	if signal.Type == "edge/pause" {
+		b.setPaused(true)
+		return
+	}
+	if signal.Type == "edge/resume" {
+		b.setPaused(false)
+		return
+	}
+	if signal.Type != "webrtc/candidate" {
 		return
 	}
 	var value string
@@ -783,6 +863,7 @@ func (b *viewBridge) addClientSignal(payload []byte) {
 func (b *viewBridge) close() {
 	b.closeOnce.Do(func() {
 		b.cancel()
+		b.stopHD()
 		b.mu.Lock()
 		remote, local, socket := b.remote, b.local, b.localSocket
 		b.mu.Unlock()

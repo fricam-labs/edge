@@ -43,6 +43,9 @@ type config struct {
 	relayURL          string
 	identityFile      string
 	frigateAuthURL    string
+	warmPolicy        string
+	maxHDStreams      int
+	warmOverrides     string
 }
 
 type packetEvent struct {
@@ -60,6 +63,7 @@ type streamMetrics struct {
 	Clients       int64  `json:"clients"`
 	LastPacketMS  *int64 `json:"last_packet_ms,omitempty"`
 	KeyframeAgeMS *int64 `json:"keyframe_age_ms,omitempty"`
+	WarmStatus    string `json:"warm_status,omitempty"`
 }
 
 type streamCache struct {
@@ -110,6 +114,9 @@ type cameraConfig struct {
 
 type frigateConfig struct {
 	Cameras map[string]cameraConfig `json:"cameras"`
+	Go2RTC  struct {
+		Streams map[string]json.RawMessage `json:"streams"`
+	} `json:"go2rtc"`
 }
 
 type streamManager struct {
@@ -117,6 +124,8 @@ type streamManager struct {
 	client  *http.Client
 	mu      sync.RWMutex
 	streams map[string]*streamCache
+	plans   map[string]cameraStreamPlan
+	hdUsers map[string]int
 }
 
 type deadlineConn struct {
@@ -175,6 +184,7 @@ func runEdge() error {
 		total, ready, connected := manager.counts()
 		result := map[string]any{
 			"status": "ok", "version": version, "cameras": total, "ready": ready, "connected": connected,
+			"progressive_video": true,
 		}
 		if relay != nil {
 			result["relay_connected"] = relay.connected.Load()
@@ -187,6 +197,9 @@ func runEdge() error {
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, manager.metrics())
 	})
+	mux.HandleFunc("GET /capabilities", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, manager.policyStatus())
+	})
 	mux.HandleFunc("GET /stream/", func(w http.ResponseWriter, r *http.Request) {
 		camera, ok := cameraFromPath(r.URL.Path)
 		if !ok {
@@ -195,6 +208,13 @@ func runEdge() error {
 		}
 		stream := manager.get(camera)
 		if stream == nil {
+			manager.mu.RLock()
+			_, configured := manager.plans[camera]
+			manager.mu.RUnlock()
+			if configured {
+				http.Error(w, "no safe warm source configured", http.StatusServiceUnavailable)
+				return
+			}
 			http.NotFound(w, r)
 			return
 		}
@@ -206,6 +226,13 @@ func runEdge() error {
 			return
 		}
 		relay.serveLocalWebRTC(w, request)
+	})
+	mux.HandleFunc("GET /webrtc/progressive", func(w http.ResponseWriter, request *http.Request) {
+		if relay == nil {
+			http.Error(w, "relay disabled", http.StatusServiceUnavailable)
+			return
+		}
+		relay.serveProgressive(w, request)
 	})
 	mux.HandleFunc("POST /pair", func(w http.ResponseWriter, r *http.Request) {
 		if relay == nil {
@@ -297,6 +324,9 @@ func loadConfig() config {
 		relayURL:          strings.TrimRight(os.Getenv("EDGE_RELAY_URL"), "/"),
 		identityFile:      env("EDGE_IDENTITY_FILE", "/data/identity.json"),
 		frigateAuthURL:    strings.TrimRight(env("FRIGATE_AUTH_URL", "https://127.0.0.1:8971"), "/"),
+		warmPolicy:        env("WARM_POLICY", "safe"),
+		maxHDStreams:      mustIntEnv("MAX_HD_STREAMS", 1, 1, 32),
+		warmOverrides:     os.Getenv("WARM_SOURCE_OVERRIDES"),
 	}
 }
 
@@ -427,12 +457,13 @@ func (m *streamManager) refreshLoop(ctx context.Context) {
 }
 
 func (m *streamManager) sync(ctx context.Context) error {
-	desired, err := discoverCameraStreams(ctx, m.client, m.cfg.frigateURL, m.cfg.preferredQuality)
+	desired, plans, err := m.discoverPlans(ctx)
 	if err != nil {
 		return err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.plans = plans
 	for name, stream := range m.streams {
 		sources, exists := desired[name]
 		if !exists || !equalStrings(stream.sourceNames, sources) {
@@ -462,11 +493,16 @@ func (m *streamManager) get(name string) *streamCache {
 func (m *streamManager) metrics() map[string]streamMetrics {
 	m.mu.RLock()
 	items := make(map[string]*streamCache, len(m.streams))
+	result := make(map[string]streamMetrics, len(m.plans))
+	for name, plan := range m.plans {
+		if len(plan.Warm) == 0 {
+			result[name] = streamMetrics{WarmStatus: plan.Reason}
+		}
+	}
 	for name, stream := range m.streams {
 		items[name] = stream
 	}
 	m.mu.RUnlock()
-	result := make(map[string]streamMetrics, len(items))
 	for name, stream := range items {
 		result[name] = stream.metrics()
 	}

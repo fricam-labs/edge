@@ -760,6 +760,16 @@ func (m *streamManager) signalingSource(requested string) (string, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	base := strings.TrimSuffix(requested, "_talk")
+	for camera, plan := range m.plans {
+		if requested == camera {
+			return plan.Detail, true
+		}
+		for _, source := range plan.Sources {
+			if requested == source {
+				return requested, true
+			}
+		}
+	}
 	for camera, stream := range m.streams {
 		if requested == camera || (strings.HasSuffix(requested, "_talk") && base == camera) {
 			return requested, true
@@ -954,11 +964,23 @@ func (r *relayController) writeLocalSignal(id string, payload json.RawMessage) {
 			return
 		}
 		if offer, ok := parseViewBridgeOffer(payload); ok {
-			bridge := newViewBridge(session.ctx, r.go2rtcURL, session.source, func() [][]byte {
-				return r.manager.h264Bootstrap(session.source)
+			source := session.source
+			detail := ""
+			if offer.Progressive {
+				if warm, hd, ready := r.manager.progressiveSources(session.camera); ready {
+					source, detail = warm, hd
+				}
+			}
+			bridge := newViewBridge(session.ctx, r.go2rtcURL, source, func() [][]byte {
+				return r.manager.h264Bootstrap(source)
 			}, offer, func(signal json.RawMessage) {
 				r.send(relayEnvelope{SessionID: id, Payload: signal})
 			})
+			bridge.detailSource, bridge.manager = detail, r.manager
+			if (offer.Progressive && detail == "") || (!offer.Progressive && r.manager.requiresDemand(source)) {
+				bridge.demandBase = true
+				bridge.detailSource = source
+			}
 			session.view = bridge
 			session.writeMu.Unlock()
 			go func() {
@@ -1042,9 +1064,11 @@ func sanitizeSignalForGo2RTC(payload []byte) ([]byte, bool) {
 		return payload, true
 	}
 	var offer struct {
-		Type       string          `json:"type"`
-		SDP        string          `json:"sdp"`
-		ICEServers []edgeICEServer `json:"ice_servers"`
+		Type        string          `json:"type"`
+		SDP         string          `json:"sdp"`
+		ICEServers  []edgeICEServer `json:"ice_servers"`
+		WarmPaused  bool            `json:"warm_paused,omitempty"`
+		Progressive bool            `json:"progressive_video,omitempty"`
 	}
 	if json.Unmarshal(signal.Value, &offer) != nil || offer.Type != "offer" ||
 		offer.SDP == "" || len(offer.SDP) > 96*1024 || len(offer.ICEServers) == 0 || len(offer.ICEServers) > 2 {

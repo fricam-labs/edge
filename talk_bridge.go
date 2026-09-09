@@ -20,10 +20,11 @@ import (
 const talkBridgeTimeout = 20 * time.Second
 
 type talkBridgeOffer struct {
-	Type       string          `json:"type"`
-	SDP        string          `json:"sdp"`
-	ICEServers []edgeICEServer `json:"ice_servers"`
-	WarmPaused bool            `json:"warm_paused,omitempty"`
+	Type        string          `json:"type"`
+	SDP         string          `json:"sdp"`
+	ICEServers  []edgeICEServer `json:"ice_servers"`
+	WarmPaused  bool            `json:"warm_paused,omitempty"`
+	Progressive bool            `json:"progressive_video,omitempty"`
 }
 
 type talkBridge struct {

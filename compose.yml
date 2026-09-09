@@ -35,8 +35,10 @@ services:
       FRIGATE_URL: http://127.0.0.1:5000
       GO2RTC_URL: http://127.0.0.1:1984
       LIVE_QUALITY: HD
+      WARM_POLICY: safe
+      MAX_HD_STREAMS: 1
       DISCOVERY_INTERVAL_SEC: 30
-      SOURCE_IDLE_TIMEOUT_SEC: 15
+      SOURCE_IDLE_TIMEOUT_SEC: 60
       MAX_CACHE_MIB: 16
       # Production remote access: outbound signaling only. No tunnel or
       # inbound public port is required.
