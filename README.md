@@ -37,6 +37,10 @@ Then select that server profile in Fricam and open **Settings → Fricam Edge**.
 Run one Edge instance beside each Frigate server. Fricam stores pairing material
 per server profile, so multi-server setups remain isolated.
 
+Running Frigate as a Home Assistant add-on instead of a container you manage
+yourself? See [`docs/home-assistant.md`](docs/home-assistant.md) for that
+setup.
+
 The sidecar discovers every enabled Frigate camera and keeps an economical
 go2rtc stream warm, storing its latest decodable GOP in RAM. A new client
 receives the cached startup frame and continues watching live video while HD
