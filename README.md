@@ -2,7 +2,7 @@
 
 [![Tests](https://github.com/fricam-labs/edge/actions/workflows/container.yml/badge.svg?branch=main&event=push)](https://github.com/fricam-labs/edge/actions/workflows/container.yml?query=branch%3Amain)
 
-Open-source acceleration service for the Fricam Android client and self-hosted
+Open-source acceleration service for the Fricam Android and iOS clients and self-hosted
 Frigate servers.
 
 ## Install
@@ -91,7 +91,7 @@ the source reconnects, and is replaced as soon as the fallback produces a new
 keyframe.
 
 Endpoints bind to port 8099. The Compose file exposes this on the private
-LAN/Tailscale interfaces so the Android app can auto-discover it:
+LAN/Tailscale interfaces so the Android and iOS apps can auto-discover it:
 
 - `GET /health`
 - `GET /metrics`
@@ -113,7 +113,7 @@ For remote access it opens one outbound `wss://relay.fricam.app` control
 connection. The Worker forwards only bounded SDP/ICE JSON. Camera media travels
 over DTLS-SRTP through a direct WebRTC path or Cloudflare TURN fallback; the
 Worker and TURN service cannot decrypt it. No Cloudflare Tunnel, inbound public
-port, or cloud media storage is used. Android pairs while on the LAN through
+port, or cloud media storage is used. The mobile app pairs while on the LAN through
 `POST /pair`, whose Frigate bearer token is validated only against the private
 loopback Frigate HTTPS endpoint.
 
