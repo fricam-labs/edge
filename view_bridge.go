@@ -349,7 +349,8 @@ func (b *viewBridge) start() error {
 		return fmt.Errorf("local stream: %w", err)
 	}
 	if err := waitContext(remoteConnected, ctx); err != nil {
-		return err
+		b.mark("stall_remote_not_connected")
+		return fmt.Errorf("client peer did not connect: %w", err)
 	}
 	b.mark("remote_connected")
 	if b.paused.Load() {
@@ -364,7 +365,11 @@ func (b *viewBridge) start() error {
 		return nil
 	}
 	close(b.remoteReady)
-	return waitContext(firstVideo, ctx)
+	if err := waitContext(firstVideo, ctx); err != nil {
+		b.mark("stall_no_first_video")
+		return fmt.Errorf("no video from go2rtc: %w", err)
+	}
+	return nil
 }
 
 func edgeICEServers(servers []edgeICEServer) []webrtc.ICEServer {
@@ -428,6 +433,7 @@ func (b *viewBridge) connectRemote(
 	connected := make(chan struct{})
 	var connectedOnce sync.Once
 	peer.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		b.mark("remote_peer_" + state.String())
 		if state == webrtc.PeerConnectionStateConnected {
 			connectedOnce.Do(func() { close(connected) })
 		}
@@ -488,6 +494,9 @@ func (b *viewBridge) connectLocal(
 	}
 	b.local = peer
 	b.mu.Unlock()
+	peer.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		b.mark("local_peer_" + state.String())
+	})
 	if _, err = peerAddTransceiverFromKind(peer, webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{
 		Direction: webrtc.RTPTransceiverDirectionRecvonly,
 	}); err != nil {
