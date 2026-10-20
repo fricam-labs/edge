@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -421,6 +422,49 @@ func TestValidateFrigateAuthorizationRejectsRedirect(t *testing.T) {
 	defer server.Close()
 	if validateFrigateAuthorization(context.Background(), server.URL, "Bearer secret") {
 		t.Fatal("redirected authorization check was accepted")
+	}
+}
+
+func TestAuthorizePairingFallsBackOnlyWhenFrigateAuthIsDisabled(t *testing.T) {
+	frigate := func(body string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/api/config" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, body)
+		}))
+	}
+	disabled := frigate(`{"auth":{"enabled":false},"cameras":{}}`)
+	defer disabled.Close()
+	enabled := frigate(`{"auth":{"enabled":true},"cameras":{}}`)
+	defer enabled.Close()
+	unknown := frigate(`{"cameras":{}}`)
+	defer unknown.Close()
+	rejecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	}))
+	defer rejecting.Close()
+	const unreachable = "http://127.0.0.1:1"
+
+	cases := []struct {
+		name, authURL, frigateURL, authorization string
+		want                                     bool
+	}{
+		{"auth port down, auth disabled", unreachable, disabled.URL, "Bearer fricam-anonymous", true},
+		{"auth port down, auth enabled", unreachable, enabled.URL, "Bearer fricam-anonymous", false},
+		{"auth port down, auth state unknown", unreachable, unknown.URL, "Bearer fricam-anonymous", false},
+		{"auth port down, Frigate down", unreachable, unreachable, "Bearer fricam-anonymous", false},
+		{"auth port rejects, auth disabled", rejecting.URL, disabled.URL, "Bearer fricam-anonymous", false},
+		{"no Authorization header", unreachable, disabled.URL, "", false},
+		{"public Frigate host", unreachable, "http://example.com", "Bearer fricam-anonymous", false},
+	}
+	for _, tc := range cases {
+		cfg := config{frigateAuthURL: tc.authURL, frigateURL: tc.frigateURL}
+		if got := authorizePairing(context.Background(), cfg, tc.authorization); got != tc.want {
+			t.Errorf("%s: authorizePairing = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 

@@ -239,7 +239,7 @@ func runEdge() error {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "relay disabled"})
 			return
 		}
-		if !validateFrigateAuthorization(r.Context(), cfg.frigateAuthURL, r.Header.Get("Authorization")) {
+		if !authorizePairing(r.Context(), cfg, r.Header.Get("Authorization")) {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
@@ -261,7 +261,7 @@ func runEdge() error {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "relay disabled"})
 			return
 		}
-		if !validateFrigateAuthorization(r.Context(), cfg.frigateAuthURL, r.Header.Get("Authorization")) {
+		if !authorizePairing(r.Context(), cfg, r.Header.Get("Authorization")) {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
@@ -330,13 +330,39 @@ func loadConfig() config {
 	}
 }
 
+// authorizePairing accepts a pairing request when the caller's credentials pass
+// Frigate's authenticated port. Installs with Frigate auth disabled often do not
+// run that port at all; only then, and only if Frigate itself reports auth as
+// disabled, is the request accepted without credentials. A port that answers and
+// rejects the credentials is never bypassed.
+func authorizePairing(ctx context.Context, cfg config, authorization string) bool {
+	ok, reachable := checkFrigateAuthorization(ctx, cfg.frigateAuthURL, authorization)
+	if ok || reachable {
+		return ok
+	}
+	if frigateAuthDisabled(ctx, cfg.frigateURL) {
+		log.Printf("edge pairing accepted: %s unreachable and Frigate auth is disabled", cfg.frigateAuthURL)
+		return true
+	}
+	return false
+}
+
 func validateFrigateAuthorization(ctx context.Context, authURL, authorization string) bool {
+	ok, _ := checkFrigateAuthorization(ctx, authURL, authorization)
+	return ok
+}
+
+// checkFrigateAuthorization reports whether Frigate accepted the credentials and
+// whether its authenticated endpoint answered at all.
+func checkFrigateAuthorization(ctx context.Context, authURL, authorization string) (ok, reachable bool) {
 	if authorization == "" || (!strings.HasPrefix(authorization, "Bearer ") && !strings.HasPrefix(authorization, "Basic ")) {
-		return false
+		log.Printf("edge pairing rejected: missing or unsupported Authorization header")
+		return false, true
 	}
 	parsedAuthURL, err := url.Parse(authURL)
 	if err != nil || !isPrivateAuthHost(parsedAuthURL.Hostname()) {
-		return false
+		log.Printf("edge pairing rejected: FRIGATE_AUTH_URL %q is not a private host", authURL)
+		return false, true
 	}
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, authURL+"/api/config", nil)
 	req.Header.Set("Authorization", authorization)
@@ -356,10 +382,52 @@ func validateFrigateAuthorization(ctx context.Context, authURL, authorization st
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		log.Printf("edge pairing: Frigate auth endpoint %s unreachable: %v", authURL, err)
+		return false, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("edge pairing rejected: Frigate auth endpoint %s returned %d", authURL, resp.StatusCode)
+		return false, true
+	}
+	return true, true
+}
+
+// frigateAuthDisabled asks Frigate's internal port whether authentication is
+// turned off. Anything other than an explicit `auth.enabled: false` counts as on.
+func frigateAuthDisabled(ctx context.Context, frigateURL string) bool {
+	parsed, err := url.Parse(frigateURL)
+	if err != nil || !isPrivateAuthHost(parsed.Hostname()) {
+		return false
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, frigateURL+"/api/config", nil)
+	if err != nil {
+		return false
+	}
+	client := &http.Client{
+		Timeout: 3 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("edge pairing: Frigate %s unreachable: %v", frigateURL, err)
 		return false
 	}
 	defer resp.Body.Close()
-	return resp.StatusCode >= 200 && resp.StatusCode < 300
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	var body struct {
+		Auth struct {
+			Enabled *bool `json:"enabled"`
+		} `json:"auth"`
+	}
+	if json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(&body) != nil || body.Auth.Enabled == nil {
+		return false
+	}
+	return !*body.Auth.Enabled
 }
 
 func isPrivateAuthHost(host string) bool {
