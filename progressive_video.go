@@ -19,8 +19,15 @@ func (b *viewBridge) startHD() {
 	}
 	release, ok := b.manager.acquireHD(b.detailSource)
 	if !ok {
+		demandBase := b.demandBase
 		b.mu.Unlock()
-		b.sendSignal("edge/quality", "busy")
+		// demandBase has no base track already playing to fall back to: "busy"
+		// here means the stream itself never starts, not a quality downgrade.
+		if demandBase {
+			b.sendSignal("error", "stream unavailable")
+		} else {
+			b.sendSignal("edge/quality", "busy")
+		}
 		return
 	}
 	child := newViewBridge(b.ctx, b.go2rtcURL, b.detailSource, nil, viewBridgeOffer{}, func(_ json.RawMessage) {})
@@ -65,7 +72,13 @@ func (b *viewBridge) startHD() {
 		}
 		if err != nil {
 			b.stopHDGeneration(generation)
-			b.sendSignal("edge/quality", "unavailable")
+			// demandBase has no base track already playing to fall back to: a
+			// connect failure here means the stream itself never starts.
+			if b.demandBase {
+				b.sendSignal("error", "stream unavailable")
+			} else {
+				b.sendSignal("edge/quality", "unavailable")
+			}
 			return
 		}
 		b.sendSignal("edge/quality", "hd-sending")
@@ -93,7 +106,13 @@ func (b *viewBridge) startHD() {
 				now := child.videoPacketsForwarded.Load()
 				if now == last {
 					b.stopHDGeneration(generation)
-					b.sendSignal("edge/quality", "unavailable")
+					// demandBase has no base track already playing to fall back
+					// to: a stalled source here means the stream never starts.
+					if b.demandBase {
+						b.sendSignal("error", "stream unavailable")
+					} else {
+						b.sendSignal("edge/quality", "unavailable")
+					}
 					return
 				}
 				last = now

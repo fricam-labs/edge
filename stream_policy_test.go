@@ -194,3 +194,36 @@ func TestDemandPrewarmDoesNotOpenAnEncoderUntilResume(t *testing.T) {
 		t.Fatal("paused demand source retained its lease")
 	}
 }
+
+func TestStartHDBusyFailsDemandBaseButDowngradesProgressive(t *testing.T) {
+	manager := newStreamManager(config{maxHDStreams: 1})
+	release, ok := manager.acquireHD("other")
+	if !ok {
+		t.Fatal("first lease")
+	}
+	defer release()
+	hdTrack, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264}, "video-hd", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		demandBase bool
+		want       string
+	}{
+		{true, `{"type":"error","value":"stream unavailable"}`},
+		{false, `{"type":"edge/quality","value":"busy"}`},
+	} {
+		var sent []string
+		bridge := newViewBridge(context.Background(), "", "front_sub", nil, viewBridgeOffer{}, func(payload json.RawMessage) {
+			sent = append(sent, string(payload))
+		})
+		bridge.manager, bridge.detailSource, bridge.demandBase = manager, "front", tc.demandBase
+		if !tc.demandBase {
+			bridge.hdVideo = hdTrack
+		}
+		bridge.startHD()
+		if len(sent) != 1 || sent[0] != tc.want {
+			t.Fatalf("demandBase=%v sent %v, want %s", tc.demandBase, sent, tc.want)
+		}
+	}
+}
